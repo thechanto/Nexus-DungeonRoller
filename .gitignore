@@ -25,6 +25,9 @@ _ai/
 Backups/
 _Backups/
 _Quarantine/
+# Per-session editor automation debris. Recipes worth keeping live in the
+# plugin's own notes, not here.
+Content/UnrealClaude/Scripts/
 T3D_Verify/
 ClaudeScripts/
 .claude_scripts/
