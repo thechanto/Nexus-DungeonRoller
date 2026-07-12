@@ -1,0 +1,49 @@
+# ---- Unreal Engine generated / build output ----
+Binaries/
+DerivedDataCache/
+Intermediate/
+Build/
+
+# Saved/ is generated, EXCEPT SaveGames (ability keybinds) which we keep.
+Saved/*
+!Saved/SaveGames/
+
+# ---- IDE / tooling ----
+.vs/
+.vsconfig
+.idea/
+*.sln
+*.suo
+*.xcodeproj
+*.xcworkspace
+*.VC.db
+*.opendb
+
+# ---- Scratch / working folders ----
+_ai/
+Backups/
+_Quarantine/
+T3D_Verify/
+ClaudeScripts/
+.claude_scripts/
+.tmp_scripts/
+.gdep/
+
+# ---- Epic Paragon packs (free, re-downloadable from Fab at these same paths) ----
+# Excluded to keep the repo ~2.3 GB instead of ~15.3 GB.
+Content/ParagonFengMao/
+Content/ParagonGideon/
+Content/ParagonGreystone/
+Content/ParagonKhaimera/
+Content/ParagonNarbash/
+Content/ParagonSevarog/
+Content/ParagonSparrow/
+Content/ParagonTerra/
+
+# ---- Editor & backup litter ----
+*.bak
+*.bak[0-9]
+*.bak-*
+*.uproject.bak-*
+*.autosave
+*.tmp

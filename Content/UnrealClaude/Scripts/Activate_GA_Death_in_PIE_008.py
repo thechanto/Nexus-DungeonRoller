@@ -1,0 +1,11 @@
+import unreal
+ues = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+w = ues.get_game_world()
+unreal.log_warning("NEXUS_DEATH world=%s" % (w.get_name() if w else "NONE"))
+pawn = unreal.GameplayStatics.get_player_pawn(w, 0)
+unreal.log_warning("NEXUS_DEATH pawn=%s" % (pawn.get_name() if pawn else "NONE"))
+asc = pawn.get_component_by_class(unreal.AbilitySystemComponent)
+unreal.log_warning("NEXUS_DEATH asc=%s" % (asc.get_name() if asc else "NONE"))
+cls = unreal.load_class(None, "/Game/GameplayAbilitySystem/Abilities/GA_Death.GA_Death_C")
+ok = asc.try_activate_ability_by_class(cls, True)
+unreal.log_warning("NEXUS_DEATH try_activate GA_Death -> %s" % ok)
