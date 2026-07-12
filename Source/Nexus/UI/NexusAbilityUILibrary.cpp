@@ -2536,6 +2536,66 @@ bool UNexusAbilityUILibrary::OpenContainerLoot(AActor* Looter, AActor* Container
 	return true;
 }
 
+int32 UNexusAbilityUILibrary::TakeAllLoot(AActor* Looter, UNarrativeInventoryComponent* Source,
+	FText& OutError, bool& bOutContainerEmpty)
+{
+	OutError = FText::GetEmpty();
+	bOutContainerEmpty = false;
+
+	if (!Source)
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("TakeAllLoot: no loot source"));
+		return 0;
+	}
+
+	UNarrativeInventoryComponent* RunInventory = FindPlayerInventory(Looter, RunInventoryName);
+	if (!RunInventory)
+	{
+		return 0;
+	}
+
+	// GetItems returns the array by value, so consuming stacks below cannot invalidate this.
+	const TArray<UNarrativeItem*> LootItems = Source->GetItems();
+
+	int32 TakenCount = 0;
+	for (UNarrativeItem* Item : LootItems)
+	{
+		if (!IsValid(Item) || Item->GetQuantity() <= 0)
+		{
+			continue;
+		}
+
+		// RequestLootItem refuses the whole request unless the quantity wholly fits, so ask only
+		// for what there is room for. NoSpaceReason is the plugin's own player-facing wording.
+		FText NoSpaceReason;
+		const int32 Space = RunInventory->GetSpaceForItem(Item->GetClass(), NoSpaceReason);
+		const int32 Quantity = FMath::Min(Item->GetQuantity(), Space);
+		if (Quantity <= 0)
+		{
+			OutError = NoSpaceReason;
+			continue;
+		}
+
+		FText ErrorText;
+		if (RunInventory->RequestLootItem(Item, ErrorText, Quantity))
+		{
+			TakenCount += Quantity;
+		}
+		else
+		{
+			OutError = ErrorText;
+		}
+	}
+
+	// Anything left behind (did not fit) keeps the menu open; the caller closes on empty.
+	bOutContainerEmpty = Source->GetItems().Num() == 0;
+
+	UE_LOG(LogNexusAbilityUI, Log, TEXT("TakeAllLoot: %s took %d item(s) from %s (empty=%s)"),
+		*GetNameSafe(Looter), TakenCount, *GetNameSafe(Source),
+		bOutContainerEmpty ? TEXT("true") : TEXT("false"));
+	return TakenCount;
+}
+
 void UNexusAbilityUILibrary::ClearRunInventory(AActor* PlayerActor)
 {
 	UNarrativeInventoryComponent* RunInventory = FindPlayerInventory(PlayerActor, RunInventoryName);

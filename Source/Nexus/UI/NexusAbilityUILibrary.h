@@ -237,6 +237,30 @@ public:
 	static bool OpenContainerLoot(AActor* Looter, AActor* Container);
 
 	/**
+	 * Chests/containers: "Take All" for the looting UI. Moves every stack in Source into Looter's
+	 * RunInventory, clamping each request to the space actually available for that item class --
+	 * Narrative's RequestLootItem is all-or-nothing per call (it refuses outright when the asked
+	 * quantity does not wholly fit), so an unclamped full-stack request would take *nothing* from
+	 * a stack that only partly fits. Whatever does not fit is left in the container.
+	 *
+	 * Iterates a snapshot: GetItems() returns the array by value, so consuming items mid-loop
+	 * cannot invalidate it.
+	 *
+	 * @param Looter              The looting player -- pawn, controller or player state all resolve.
+	 *                            No DefaultToSelf: this is called from the looting widget, whose
+	 *                            self is a UUserWidget and would not satisfy an AActor pin.
+	 * @param Source              The container's inventory (the looting widget's LootSource).
+	 * @param OutError            Why the last stack could not be taken, for the UI notification.
+	 *                            Empty when everything transferred.
+	 * @param bOutContainerEmpty  True when Source holds nothing afterwards -- the caller closes
+	 *                            the looting menu on this.
+	 * @return Number of individual items (not stacks) moved into RunInventory.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Loot")
+	static int32 TakeAllLoot(AActor* Looter, class UNarrativeInventoryComponent* Source,
+		FText& OutError, bool& bOutContainerEmpty);
+
+	/**
 	 * Extraction game: empties the run inventory (items + currency) so dying loses the run's
 	 * loot. Safe to call when the player state or component is missing. Items whose
 	 * CanBeRemoved() is false (quest items) survive by the plugin's own rule.

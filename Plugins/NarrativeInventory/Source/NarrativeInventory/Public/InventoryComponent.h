@@ -430,10 +430,15 @@ protected:
 	UFUNCTION(BlueprintCallable, Category = "Inventory")
 	virtual void StopLooting();
 
+public:
+
 	/** Loot an item. Clients RPC to tell server they want to do this; server will validate to prevent cheating
 		If we're client return true/false if we notified server to loot. Server returns true if loot actually happened. */
+	// NEXUS PATCH: moved to public for TakeAllLoot (NexusAbilityUILibrary) - was protected.
 	UFUNCTION(BlueprintCallable, Category = "Inventory")
 	virtual bool RequestLootItem(class UNarrativeItem* ItemToLoot, FText& ErrorText, const int32 Quantity = 1);
+
+protected:
 
 	UFUNCTION(Server, Reliable)
 	virtual void ServerRequestLootItem(class UNarrativeItem* ItemToLoot, const int32 Quantity);
