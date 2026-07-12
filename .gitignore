@@ -4,9 +4,10 @@ DerivedDataCache/
 Intermediate/
 Build/
 
-# Saved/ is generated, EXCEPT SaveGames (ability keybinds) which we keep.
+# Saved/ is generated, including SaveGames. The fresh-save seed regenerates a
+# fully configured save (100 points, ults slotted), so a committed .sav would
+# shadow that seed on fresh clones.
 Saved/*
-!Saved/SaveGames/
 
 # ---- IDE / tooling ----
 .vs/
