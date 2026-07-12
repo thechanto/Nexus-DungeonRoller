@@ -244,15 +244,81 @@ namespace
 		TEXT("Health"), TEXT("Stamina"), TEXT("Mana")
 	};
 
+	// TESTING VALUE: a fresh save is minted with enough points to buy anything on the
+	// Skills screen without grinding. Revisit before any real balance pass.
+	constexpr double GFreshSaveStatPoints = 100.0;
+	constexpr double GFreshSaveTalentPoints = 100.0;
+
+	// Ultimates a fresh save starts with: unlocked and already sitting on their keybind.
+	// The unlock key is the data class name, which is derived from the path below, so the
+	// path is the single source of truth for both arrays.
+	struct FFreshSaveAbilitySeed
+	{
+		const TCHAR* DataClassPath;
+		int32 SlotIndex;
+	};
+
+	const FFreshSaveAbilitySeed GFreshSaveAbilities[] =
+	{
+		{ TEXT("/Game/GameplayAbilitySystem/Abilities/DataAssets/Mage/DA_Ability_Mage_Burden.DA_Ability_Mage_Burden_C"), 2 },
+		{ TEXT("/Game/GameplayAbilitySystem/Abilities/DataAssets/Warrior/DA_Ability_Warrior_SkyCrusher.DA_Ability_Warrior_SkyCrusher_C"), 3 }
+	};
+
+	// Defined below, next to the UnlockedAbilities/AssignedAbilities helpers it needs.
+	void SeedFreshSaveAbilities(USaveGame* Save);
+
+	// The first-run state: all stats 10, GFreshSaveStatPoints points, the
+	// GFreshSaveAbilities ultimates unlocked and sitting on their keybinds.
+	void InitializeFreshSave(USaveGame* Save)
+	{
+		const UStruct* TalentStruct = nullptr;
+		void* TalentPtr = nullptr;
+		GetSavedTalentDataMutable(Save, TalentStruct, TalentPtr);
+		if (TalentStruct && TalentPtr)
+		{
+			for (const TCHAR* Field : GFreshSaveStatFields)
+			{
+				if (!WriteNumericField(TalentStruct, TalentPtr, Field, 10.0))
+				{
+					UE_LOG(LogNexusAbilityUI, Warning,
+						TEXT("InitializeFreshSave: fresh save has no '%s' field to initialize"), Field);
+				}
+			}
+			WriteNumericField(TalentStruct, TalentPtr, TEXT("StatPoints"), GFreshSaveStatPoints);
+			WriteNumericField(TalentStruct, TalentPtr, TEXT("TalentPoints"), GFreshSaveTalentPoints);
+		}
+		else
+		{
+			UE_LOG(LogNexusAbilityUI, Warning,
+				TEXT("InitializeFreshSave: fresh save has no PlayerTalentData struct to initialize"));
+		}
+
+		SeedFreshSaveAbilities(Save);
+	}
+
 	/**
 	 * ResolveSaveGame, but never returns null while the BP_SaveGame class loads:
-	 * when no save exists a fresh one is created (all stats 10, 50 stat points)
-	 * and written to the slot the in-game Blueprint flow will look for.
+	 * when no save exists a fresh one is created (see InitializeFreshSave) and written
+	 * to the slot the in-game Blueprint flow will look for.
 	 */
 	USaveGame* ResolveOrCreateSaveGame(const UObject* WorldContext, FString& OutSlotName)
 	{
 		if (USaveGame* Existing = ResolveSaveGame(WorldContext, OutSlotName))
 		{
+			// The BP controller flow mints a blank BP_SaveGame into the GameInstance map
+			// before the pawn is possessed, so booting straight into a level on a wiped
+			// SaveGames folder resolves an in-memory save with nothing on disk behind it.
+			// That object is a first-run save; seed it like one we minted ourselves. The
+			// disk check is the guard: a slot the player has ever saved is never touched,
+			// so this cannot stomp a deliberately-cleared keybind or spent points.
+			if (!UGameplayStatics::DoesSaveGameExist(OutSlotName, 0))
+			{
+				InitializeFreshSave(Existing);
+				const bool bSaved = UGameplayStatics::SaveGameToSlot(Existing, OutSlotName, 0);
+				UE_LOG(LogNexusAbilityUI, Log,
+					TEXT("ResolveOrCreateSaveGame: seeded unpersisted save (stats 10, points %.0f) in slot '%s' -> %s"),
+					GFreshSaveStatPoints, *OutSlotName, bSaved ? TEXT("saved") : TEXT("SAVE FAILED"));
+			}
 			return Existing;
 		}
 
@@ -265,33 +331,13 @@ namespace
 		}
 
 		USaveGame* Save = UGameplayStatics::CreateSaveGameObject(SaveClass);
-		const UStruct* TalentStruct = nullptr;
-		void* TalentPtr = nullptr;
-		GetSavedTalentDataMutable(Save, TalentStruct, TalentPtr);
-		if (TalentStruct && TalentPtr)
-		{
-			for (const TCHAR* Field : GFreshSaveStatFields)
-			{
-				if (!WriteNumericField(TalentStruct, TalentPtr, Field, 10.0))
-				{
-					UE_LOG(LogNexusAbilityUI, Warning,
-						TEXT("ResolveOrCreateSaveGame: fresh save has no '%s' field to initialize"), Field);
-				}
-			}
-			WriteNumericField(TalentStruct, TalentPtr, TEXT("StatPoints"), 50.0);
-			WriteNumericField(TalentStruct, TalentPtr, TEXT("TalentPoints"), 50.0);
-		}
-		else
-		{
-			UE_LOG(LogNexusAbilityUI, Warning,
-				TEXT("ResolveOrCreateSaveGame: fresh save has no PlayerTalentData struct to initialize"));
-		}
+		InitializeFreshSave(Save);
 
 		OutSlotName = GDefaultSaveSlotName;
 		const bool bSaved = UGameplayStatics::SaveGameToSlot(Save, OutSlotName, 0);
 		UE_LOG(LogNexusAbilityUI, Log,
-			TEXT("ResolveOrCreateSaveGame: created fresh save (stats 10, points 50) in slot '%s' -> %s"),
-			*OutSlotName, bSaved ? TEXT("saved") : TEXT("SAVE FAILED"));
+			TEXT("ResolveOrCreateSaveGame: created fresh save (stats 10, points %.0f) in slot '%s' -> %s"),
+			GFreshSaveStatPoints, *OutSlotName, bSaved ? TEXT("saved") : TEXT("SAVE FAILED"));
 		return Save;
 	}
 
@@ -1756,6 +1802,56 @@ namespace
 		return true;
 	}
 
+	// Declared up by ResolveOrCreateSaveGame, which only ever runs this on a save that has
+	// never been written to disk, so it can never overwrite a slot the player has
+	// deliberately cleared. It appends to UnlockedAbilities rather than assuming it is empty.
+	void SeedFreshSaveAbilities(USaveGame* Save)
+	{
+		const FArrayProperty* UnlockedProp = FindUnlockedAbilitiesProp(Save);
+		if (!UnlockedProp)
+		{
+			UE_LOG(LogNexusAbilityUI, Warning,
+				TEXT("SeedFreshSaveAbilities: %s has no UnlockedAbilities TArray<FString> variable"),
+				Save ? *Save->GetClass()->GetName() : TEXT("null save"));
+			return;
+		}
+
+		const FStrProperty* UnlockedInner = CastField<FStrProperty>(UnlockedProp->Inner);
+		FScriptArrayHelper UnlockedHelper(UnlockedProp, UnlockedProp->ContainerPtrToValuePtr<void>(Save));
+
+		TArray<FString> Assigned;
+		ReadAssignedAbilities(Save, Assigned);
+
+		for (const FFreshSaveAbilitySeed& Seed : GFreshSaveAbilities)
+		{
+			const FString Path(Seed.DataClassPath);
+
+			// UnlockedAbilities stores the data class name; AssignedAbilities stores its
+			// full path. Derive the name from the path so the two can never disagree.
+			FString ClassName;
+			if (!Path.Split(TEXT("."), nullptr, &ClassName, ESearchCase::CaseSensitive, ESearchDir::FromEnd))
+			{
+				UE_LOG(LogNexusAbilityUI, Warning,
+					TEXT("SeedFreshSaveAbilities: '%s' is not an object path, skipped"), *Path);
+				continue;
+			}
+
+			const int32 NewIndex = UnlockedHelper.AddValue();
+			UnlockedInner->SetPropertyValue(UnlockedHelper.GetRawPtr(NewIndex), ClassName);
+
+			if (Assigned.IsValidIndex(Seed.SlotIndex))
+			{
+				Assigned[Seed.SlotIndex] = Path;
+			}
+
+			UE_LOG(LogNexusAbilityUI, Log,
+				TEXT("SeedFreshSaveAbilities: unlocked '%s', keybind slot %d"),
+				*ClassName, Seed.SlotIndex + 1);
+		}
+
+		WriteAssignedAbilities(Save, Assigned);
+	}
+
 	// The GameplayAbility class stored in AbilityClass inside the data class's S_AbilityData.
 	UClass* ResolveGrantedAbilityClass(UClass* AbilityDataClass)
 	{
@@ -1958,7 +2054,14 @@ int32 UNexusAbilityUILibrary::GrantAssignedAbilities(ACharacter* Character)
 		ASC->ClearAbility(Handle);
 	}
 
-	const TArray<FString> Assigned = GetAssignedAbilities(Character);
+	// Booting straight into a level on a wiped save would otherwise read an empty slot
+	// array and grant nothing, because the fresh save is only minted by the menu flow.
+	// Resolve-or-create here so a first-run pawn still spawns with the seeded ultimates.
+	FString SlotNameUnused;
+	USaveGame* SaveGame = ResolveOrCreateSaveGame(Character, SlotNameUnused);
+	TArray<FString> Assigned;
+	ReadAssignedAbilities(SaveGame, Assigned);
+
 	int32 GrantedCount = 0;
 	for (int32 SlotIndex = 0; SlotIndex < Assigned.Num(); ++SlotIndex)
 	{
