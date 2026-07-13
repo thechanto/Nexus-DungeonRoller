@@ -30,10 +30,14 @@ class NEXUS_API UNexusAbilityUILibrary : public UBlueprintFunctionLibrary
 
 public:
 	/**
-	 * Checks every W_AbilitySlot inside AbilitiesScreen. A slot is unlocked
-	 * (bIsUnlocked = true, LockOverlay hidden) when its ability is already in the
-	 * save game's UnlockedAbilities list, or when all its stat requirements are met
-	 * against the live ASC (in-game) or the saved talent data (main menu).
+	 * Checks every W_AbilitySlot inside AbilitiesScreen and gives its lock one of three
+	 * readings: hidden (bIsUnlocked = true) when the ability is in the save game's
+	 * UnlockedAbilities list; gold when it is not owned but every stat requirement is
+	 * already met, i.e. the player can afford it right now; dim grey otherwise.
+	 * Requirements are evaluated against the live ASC (in-game) or the saved talent data
+	 * (main menu). Also refills each tile's RequirementsRow with green/red stat chips.
+	 *
+	 * Note this only READS the save; unlocking is UnlockAbility's job.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Nexus|UI", meta = (DefaultToSelf = "AbilitiesScreen"))
 	static void CheckRequirements(UUserWidget* AbilitiesScreen);

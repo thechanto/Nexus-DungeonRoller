@@ -12,6 +12,7 @@
 #include "Components/HorizontalBox.h"
 #include "Components/HorizontalBoxSlot.h"
 #include "Components/Image.h"
+#include "Components/PanelWidget.h"
 #include "Components/TextBlock.h"
 #include "Components/SceneComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -657,7 +658,27 @@ namespace
 		return Save;
 	}
 
-	void UnlockSlot(UUserWidget* SlotWidget)
+	const FLinearColor GReqMetGreen(0.25f, 0.72f, 0.30f, 1.0f);
+	const FLinearColor GReqUnmetRed(0.80f, 0.22f, 0.16f, 1.0f);
+	const FLinearColor GDisabledGrey(0.22f, 0.22f, 0.22f, 1.0f);
+	// Locked-and-unaffordable lock tint: visible, but reads as inert next to the gold.
+	const FLinearColor GLockDim(0.34f, 0.34f, 0.38f, 1.0f);
+
+	// The requested C9A55CFF, converted at call time (FromSRGBColor's lookup table is
+	// not safe to use during static initialization).
+	FLinearColor UnlockGold()
+	{
+		return FLinearColor::FromSRGBColor(FColor(0xC9, 0xA5, 0x5C, 0xFF));
+	}
+
+	enum class ENexusSlotState : uint8
+	{
+		Locked,      // requirements not met
+		Affordable,  // requirements met but not purchased yet -> gold lock
+		Owned        // in the save's UnlockedAbilities -> no lock at all
+	};
+
+	void SetSlotUnlockedFlag(UUserWidget* SlotWidget, bool bUnlocked)
 	{
 		// The Blueprint variable was authored as "bIsUnlocked " (trailing space),
 		// so compare trimmed names instead of using FindFProperty.
@@ -665,14 +686,89 @@ namespace
 		{
 			if (It->GetName().TrimStartAndEnd() == TEXT("bIsUnlocked"))
 			{
-				It->SetPropertyValue_InContainer(SlotWidget, true);
+				It->SetPropertyValue_InContainer(SlotWidget, bUnlocked);
 				break;
 			}
 		}
+	}
 
-		if (UWidget* LockOverlay = SlotWidget->GetWidgetFromName(TEXT("LockOverlay")))
+	UImage* FindLockImage(const UUserWidget* SlotWidget)
+	{
+		if (UImage* Named = Cast<UImage>(SlotWidget->GetWidgetFromName(TEXT("Image_64"))))
+		{
+			return Named;
+		}
+		// Name-independent fallback: first image under the lock overlay.
+		if (const UPanelWidget* Overlay = Cast<UPanelWidget>(SlotWidget->GetWidgetFromName(TEXT("LockOverlay"))))
+		{
+			for (int32 Index = 0; Index < Overlay->GetChildrenCount(); ++Index)
+			{
+				if (UImage* Image = Cast<UImage>(Overlay->GetChildAt(Index)))
+				{
+					return Image;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	/**
+	 * Three readings of the lock: gone once the ability is owned, gold while the player
+	 * already meets every requirement (i.e. can afford it now), dim grey otherwise.
+	 */
+	void ApplySlotState(UUserWidget* SlotWidget, ENexusSlotState State)
+	{
+		SetSlotUnlockedFlag(SlotWidget, State == ENexusSlotState::Owned);
+
+		UWidget* LockOverlay = SlotWidget->GetWidgetFromName(TEXT("LockOverlay"));
+		if (!LockOverlay)
+		{
+			return;
+		}
+		if (State == ENexusSlotState::Owned)
 		{
 			LockOverlay->SetVisibility(ESlateVisibility::Hidden);
+			return;
+		}
+
+		// HitTestInvisible so the overlay never swallows a click on the tile's button.
+		LockOverlay->SetVisibility(ESlateVisibility::HitTestInvisible);
+		if (UImage* LockImage = FindLockImage(SlotWidget))
+		{
+			LockImage->SetColorAndOpacity(
+				State == ENexusSlotState::Affordable ? UnlockGold() : GLockDim);
+		}
+	}
+
+	// The tile's requirement chips: same views and colours the preview panel uses.
+	void PopulateSlotRequirements(UUserWidget* SlotWidget, const FNexusStatSource& Source,
+		UClass* AbilityDataClass)
+	{
+		UHorizontalBox* Row = Cast<UHorizontalBox>(SlotWidget->GetWidgetFromName(TEXT("RequirementsRow")));
+		if (!Row || !SlotWidget->WidgetTree)
+		{
+			return;
+		}
+
+		TArray<FNexusRequirementView> Views;
+		CollectRequirementViews(Source, AbilityDataClass, Views);
+
+		Row->ClearChildren();
+		for (const FNexusRequirementView& View : Views)
+		{
+			UTextBlock* Chip = SlotWidget->WidgetTree->ConstructWidget<UTextBlock>();
+			Chip->SetText(FText::FromString(FString::Printf(TEXT("%s %d"),
+				View.Abbrev ? View.Abbrev : *View.TypeName.ToUpper(),
+				FMath::RoundToInt32(View.Required))));
+			Chip->SetColorAndOpacity(FSlateColor(View.CountsAsMet() ? GReqMetGreen : GReqUnmetRed));
+			FSlateFontInfo Font = Chip->GetFont();
+			Font.Size = 14;
+			Chip->SetFont(Font);
+			if (UHorizontalBoxSlot* ChipSlot = Row->AddChildToHorizontalBox(Chip))
+			{
+				ChipSlot->SetPadding(FMargin(0.0f, 0.0f, 8.0f, 0.0f));
+				ChipSlot->SetVerticalAlignment(VAlign_Center);
+			}
 		}
 	}
 }
@@ -759,23 +855,22 @@ void UNexusAbilityUILibrary::CheckRequirements(UUserWidget* AbilitiesScreen)
 				AbilityDataClass ? *AbilityDataClass->GetName() : TEXT("null (not assigned)"));
 		}
 
-		// Already-unlocked abilities stay unlocked regardless of current stats.
-		if (AbilityDataClass && UnlockedAbilities.Contains(AbilityDataClass->GetName()))
-		{
-			UE_LOG(LogNexusAbilityUI, Log, TEXT("Slot %s: '%s' is in saved UnlockedAbilities -> unlocking"),
-				*SlotWidget->GetName(), *AbilityDataClass->GetName());
-			UnlockSlot(SlotWidget);
-		}
-		else if (AreRequirementsMet(StatSource, AbilityDataClass, SlotWidget->GetName()))
-		{
-			UE_LOG(LogNexusAbilityUI, Log, TEXT("Slot %s: all requirements met -> unlocking"),
-				*SlotWidget->GetName());
-			UnlockSlot(SlotWidget);
-		}
-		else
-		{
-			UE_LOG(LogNexusAbilityUI, Log, TEXT("Slot %s: stays locked"), *SlotWidget->GetName());
-		}
+		// Owned beats affordable: an already-unlocked ability stays unlocked regardless
+		// of current stats (the player may have respecced below the requirement).
+		const bool bOwned = AbilityDataClass && UnlockedAbilities.Contains(AbilityDataClass->GetName());
+		const bool bAffordable = !bOwned
+			&& AreRequirementsMet(StatSource, AbilityDataClass, SlotWidget->GetName());
+
+		const ENexusSlotState State = bOwned
+			? ENexusSlotState::Owned
+			: bAffordable ? ENexusSlotState::Affordable : ENexusSlotState::Locked;
+		ApplySlotState(SlotWidget, State);
+		PopulateSlotRequirements(SlotWidget, StatSource, AbilityDataClass);
+
+		UE_LOG(LogNexusAbilityUI, Log, TEXT("Slot %s: %s"), *SlotWidget->GetName(),
+			bOwned ? TEXT("owned (in saved UnlockedAbilities) -> lock hidden")
+				: bAffordable ? TEXT("requirements met, not purchased -> gold lock")
+					: TEXT("requirements unmet -> lock stays dim"));
 	});
 
 	UE_LOG(LogNexusAbilityUI, Log,
@@ -1336,17 +1431,6 @@ void UNexusStatsPanel::RefreshFromSave()
 
 namespace
 {
-	const FLinearColor GReqMetGreen(0.25f, 0.72f, 0.30f, 1.0f);
-	const FLinearColor GReqUnmetRed(0.80f, 0.22f, 0.16f, 1.0f);
-	const FLinearColor GDisabledGrey(0.22f, 0.22f, 0.22f, 1.0f);
-
-	// The requested C9A55CFF, converted at call time (FromSRGBColor's lookup table is
-	// not safe to use during static initialization).
-	FLinearColor UnlockGold()
-	{
-		return FLinearColor::FromSRGBColor(FColor(0xC9, 0xA5, 0x5C, 0xFF));
-	}
-
 	/**
 	 * Keeps preview controllers alive and maps each abilities screen to its controller.
 	 * Needed because dispatcher/button bindings hold only weak references to the bound
