@@ -13,8 +13,10 @@
 #include "Components/HorizontalBoxSlot.h"
 #include "Components/Image.h"
 #include "Components/PanelWidget.h"
+#include "Components/PointLightComponent.h"
 #include "Components/TextBlock.h"
 #include "Components/SceneComponent.h"
+#include "Components/SphereComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/VerticalBox.h"
 #include "Components/VerticalBoxSlot.h"
@@ -72,6 +74,30 @@ namespace
 			}
 		}
 		return nullptr;
+	}
+
+	/** Reads an object-reference Blueprint variable (e.g. BP_LootPickup's "PotionMesh"). */
+	template <typename T>
+	T* ReadObjectField(const UStruct* Owner, const void* Ptr, const TCHAR* Name)
+	{
+		if (const FObjectPropertyBase* Prop = CastField<FObjectPropertyBase>(FindPropByDisplayName(Owner, Name)))
+		{
+			return Cast<T>(Prop->GetObjectPropertyValue(Prop->ContainerPtrToValuePtr<void>(Ptr)));
+		}
+		return nullptr;
+	}
+
+	/** Reads a struct Blueprint variable (FVector / FLinearColor) by value. */
+	template <typename T>
+	bool ReadStructField(const UStruct* Owner, const void* Ptr, const TCHAR* Name, T& OutValue)
+	{
+		const FStructProperty* Prop = CastField<FStructProperty>(FindPropByDisplayName(Owner, Name));
+		if (!Prop || Prop->Struct != TBaseStructure<T>::Get())
+		{
+			return false;
+		}
+		Prop->Struct->CopyScriptStruct(&OutValue, Prop->ContainerPtrToValuePtr<void>(Ptr));
+		return true;
 	}
 
 	UClass* LoadSaveGameClass()
@@ -2351,6 +2377,102 @@ bool UNexusAbilityUILibrary::GrantPotion(AActor* PlayerActor, int32 Count)
 	return true;
 }
 
+namespace
+{
+	/** Seconds a fresh pickup ignores overlaps, so every drop is seen before it can be collected. */
+	constexpr float LootPickupArmDelay = 0.6f;
+
+	/**
+	 * A pickup spawned on top of the player overlaps it the moment its components register -- which
+	 * happens inside FinishSpawningActor -- so it was granted and destroyed before it ever drew a
+	 * frame. Finisher kills are always point-blank, so that was most drops: the loot arrived in the
+	 * inventory invisibly. Bail out while the pickup is still young, and re-arm by cycling the
+	 * trigger's collision, because re-enabling collision re-runs the overlap test: a player standing
+	 * on the pickup collects it the instant it arms, without having to step off and back on.
+	 *
+	 * Disabling collision for the whole window is also what keeps this one-shot -- no further overlap
+	 * events can fire, so a second timer can never be queued for the same pickup.
+	 *
+	 * Returns true if the pickup was deferred and the caller should not collect it yet.
+	 */
+	bool DeferPickupUntilArmed(AActor* Pickup)
+	{
+		const float Age = Pickup->GetGameTimeSinceCreation();
+		if (Age >= LootPickupArmDelay)
+		{
+			return false;
+		}
+
+		UPrimitiveComponent* Trigger = Pickup->FindComponentByClass<USphereComponent>();
+		UWorld* World = Pickup->GetWorld();
+		if (!Trigger || !World)
+		{
+			// Nothing to re-arm with -- collect now rather than strand the loot forever.
+			return false;
+		}
+
+		const ECollisionEnabled::Type ArmedCollision = Trigger->GetCollisionEnabled();
+		Trigger->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+
+		FTimerHandle ArmHandle;
+		const TWeakObjectPtr<UPrimitiveComponent> WeakTrigger(Trigger);
+		World->GetTimerManager().SetTimer(ArmHandle, FTimerDelegate::CreateLambda(
+			[WeakTrigger, ArmedCollision]()
+			{
+				if (UPrimitiveComponent* ArmedTrigger = WeakTrigger.Get())
+				{
+					ArmedTrigger->SetCollisionEnabled(ArmedCollision);
+				}
+			}), LootPickupArmDelay - Age, /*bLoop*/ false);
+
+		return true;
+	}
+
+	/**
+	 * Applies BP_LootPickup's per-type look to a spawned pickup, reading the mesh, material, scale
+	 * and light colour straight off the Blueprint's own variables (GoldMesh / PotionMesh / ...).
+	 * Keeping the assets on the Blueprint rather than in string paths here is what makes them real
+	 * cook dependencies of BP_LootPickup -- a LoadObject path cooks to nothing in a packaged build.
+	 */
+	void ApplyLootPickupStyle(AActor* Pickup, bool bIsGold)
+	{
+		const UClass* PickupClass = Pickup->GetClass();
+		const TCHAR* MeshField     = bIsGold ? TEXT("GoldMesh")       : TEXT("PotionMesh");
+		const TCHAR* MaterialField = bIsGold ? TEXT("GoldMaterial")   : TEXT("PotionMaterial");
+		const TCHAR* ScaleField    = bIsGold ? TEXT("GoldScale")      : TEXT("PotionScale");
+		const TCHAR* ColourField   = bIsGold ? TEXT("GoldLightColor") : TEXT("PotionLightColor");
+
+		if (UStaticMeshComponent* MeshComp = Pickup->FindComponentByClass<UStaticMeshComponent>())
+		{
+			// SetStaticMesh clears material overrides, so the mesh has to land before the material.
+			if (UStaticMesh* Mesh = ReadObjectField<UStaticMesh>(PickupClass, Pickup, MeshField))
+			{
+				MeshComp->SetStaticMesh(Mesh);
+			}
+			if (UMaterialInterface* Material = ReadObjectField<UMaterialInterface>(PickupClass, Pickup, MaterialField))
+			{
+				MeshComp->SetMaterial(0, Material);
+			}
+			FVector Scale = FVector::OneVector;
+			if (ReadStructField(PickupClass, Pickup, ScaleField, Scale) && !Scale.IsNearlyZero())
+			{
+				MeshComp->SetRelativeScale3D(Scale);
+			}
+		}
+
+		// The Glow component's default tint is the warm gold, so the potion path must retint it --
+		// otherwise a red potion orb ships wearing a gold halo.
+		if (UPointLightComponent* Glow = Pickup->FindComponentByClass<UPointLightComponent>())
+		{
+			FLinearColor LightColour = FLinearColor::White;
+			if (ReadStructField(PickupClass, Pickup, ColourField, LightColour))
+			{
+				Glow->SetLightColor(LightColour);
+			}
+		}
+	}
+}
+
 void UNexusAbilityUILibrary::HandleLootPickup(AActor* Pickup, AActor* OtherActor)
 {
 	if (!Pickup || Pickup->IsActorBeingDestroyed() || !Pickup->HasAuthority())
@@ -2359,6 +2481,11 @@ void UNexusAbilityUILibrary::HandleLootPickup(AActor* Pickup, AActor* OtherActor
 	}
 	const ANexusCharacterBase* Player = Cast<ANexusCharacterBase>(OtherActor);
 	if (!Player || !Player->IsPlayerControlled())
+	{
+		return;
+	}
+
+	if (DeferPickupUntilArmed(Pickup))
 	{
 		return;
 	}
@@ -2445,25 +2572,12 @@ AActor* UNexusAbilityUILibrary::SpawnLootDrop(AActor* DeadEnemy, float DropChanc
 
 	UGameplayStatics::FinishSpawningActor(Pickup, SpawnTransform);
 
-	// The Blueprint's defaults are the gold-coin look; potions get a glowing orb instead.
-	// Restyle must run after FinishSpawningActor: the Blueprint's SCS components do not
-	// exist before it. The pickup may already be consumed (spawned on top of the player).
-	if (!bIsGold && IsValid(Pickup))
+	// Restyle must run after FinishSpawningActor: the Blueprint's SCS components do not exist
+	// before it. A point-blank drop overlaps the player during that call, but the arm delay in
+	// HandleLootPickup defers the collect, so the pickup is still alive to be styled here.
+	if (IsValid(Pickup))
 	{
-		if (UStaticMeshComponent* MeshComp = Pickup->FindComponentByClass<UStaticMeshComponent>())
-		{
-			if (UStaticMesh* OrbMesh = LoadObject<UStaticMesh>(nullptr,
-				TEXT("/Game/ParagonGreystone/FX/Meshes/Shapes/SM_Sphere_Scale_Unit_100.SM_Sphere_Scale_Unit_100")))
-			{
-				MeshComp->SetStaticMesh(OrbMesh);
-			}
-			if (UMaterialInterface* OrbMaterial = LoadObject<UMaterialInterface>(nullptr,
-				TEXT("/Game/StarterContent/Materials/M_Tech_Hex_Tile_Pulse_custom.M_Tech_Hex_Tile_Pulse_custom")))
-			{
-				MeshComp->SetMaterial(0, OrbMaterial);
-			}
-			MeshComp->SetRelativeScale3D(FVector(0.35f));
-		}
+		ApplyLootPickupStyle(Pickup, bIsGold);
 	}
 	UE_LOG(LogNexusAbilityUI, Log, TEXT("SpawnLootDrop: dropped %s from %s"),
 		bIsGold ? TEXT("gold") : TEXT("potion"), *DeadEnemy->GetName());
