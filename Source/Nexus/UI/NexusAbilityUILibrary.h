@@ -237,6 +237,37 @@ public:
 	static bool OpenContainerLoot(AActor* Looter, AActor* Container);
 
 	/**
+	 * Chests/containers: OpenContainerLoot after Delay seconds, so the lid starts swinging before
+	 * the looting UI covers it. A Delay of 0 opens immediately. The container is held weakly: a
+	 * chest destroyed inside the delay window simply never opens a menu.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Loot", meta = (DefaultToSelf = "Container"))
+	static void OpenContainerLootDelayed(AActor* Looter, AActor* Container, float Delay = 0.2f);
+
+	/**
+	 * Chest lid: eases the scene component named PivotName on Chest towards TargetRoll and returns
+	 * the roll it reached, which the caller stores back into its CurrentRoll variable (call from
+	 * Event Tick). Speed is an FInterpTo speed; Speed <= 0 snaps to TargetRoll in one call, which
+	 * is how BeginPlay poses the lid closed without a visible swing.
+	 *
+	 * The pivot is found BY NAME, never by child index: the editor-only BillboardComponent sits at
+	 * child index 0 in PIE and is stripped from a packaged build, so any hardcoded index would
+	 * silently rotate the wrong component in the shipped game.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Chest", meta = (DefaultToSelf = "Chest"))
+	static float TickChestLid(AActor* Chest, FName PivotName, float CurrentRoll, float TargetRoll,
+		float Speed, float DeltaTime);
+
+	/**
+	 * Chest lid: the one-shot open beat -- Sound at the chest (SoundPitch pitches the reused wood
+	 * footstep down into a lid thunk) and DustFX at the lid's hinge. Either may be null; a chest
+	 * with both null opens silently, which is a supported way to ship.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Chest", meta = (DefaultToSelf = "Chest"))
+	static void PlayChestOpenFX(AActor* Chest, class USoundBase* Sound, class UParticleSystem* DustFX,
+		FName PivotName, float SoundPitch = 0.6f);
+
+	/**
 	 * Chests/containers: "Take All" for the looting UI. Moves every stack in Source into Looter's
 	 * RunInventory, clamping each request to the space actually available for that item class --
 	 * Narrative's RequestLootItem is all-or-nothing per call (it refuses outright when the asked

@@ -13,6 +13,7 @@
 #include "Components/HorizontalBoxSlot.h"
 #include "Components/Image.h"
 #include "Components/TextBlock.h"
+#include "Components/SceneComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/VerticalBox.h"
 #include "Components/VerticalBoxSlot.h"
@@ -21,6 +22,9 @@
 #include "Materials/MaterialInterface.h"
 #include "Engine/GameInstance.h"
 #include "Engine/Texture2D.h"
+#include "Engine/World.h"
+#include "Particles/ParticleSystem.h"
+#include "TimerManager.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
@@ -2534,6 +2538,109 @@ bool UNexusAbilityUILibrary::OpenContainerLoot(AActor* Looter, AActor* Container
 	UE_LOG(LogNexusAbilityUI, Log, TEXT("OpenContainerLoot: %s looting %s"),
 		*GetNameSafe(Looter), *GetNameSafe(Container));
 	return true;
+}
+
+void UNexusAbilityUILibrary::OpenContainerLootDelayed(AActor* Looter, AActor* Container, float Delay)
+{
+	if (!Looter || !Container)
+	{
+		return;
+	}
+
+	UWorld* World = Container->GetWorld();
+	if (Delay <= 0.f || !World)
+	{
+		OpenContainerLoot(Looter, Container);
+		return;
+	}
+
+	TWeakObjectPtr<AActor> WeakLooter(Looter);
+	TWeakObjectPtr<AActor> WeakContainer(Container);
+
+	FTimerHandle Handle;
+	World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([WeakLooter, WeakContainer]()
+	{
+		if (WeakLooter.IsValid() && WeakContainer.IsValid())
+		{
+			OpenContainerLoot(WeakLooter.Get(), WeakContainer.Get());
+		}
+	}), Delay, false);
+}
+
+/** The chest's lid pivot, resolved by component name (see the header on why never by index). */
+static USceneComponent* FindChestPivot(AActor* Chest, FName PivotName)
+{
+	if (!Chest)
+	{
+		return nullptr;
+	}
+
+	for (UActorComponent* Component : Chest->GetComponents())
+	{
+		USceneComponent* Scene = Cast<USceneComponent>(Component);
+		if (Scene && Scene->GetFName() == PivotName)
+		{
+			return Scene;
+		}
+	}
+
+	// Blueprint SCS components are instanced under their template name, but a renamed or
+	// duplicated component can pick up a numeric suffix; match the prefix rather than fail.
+	const FString Prefix = PivotName.ToString();
+	for (UActorComponent* Component : Chest->GetComponents())
+	{
+		USceneComponent* Scene = Cast<USceneComponent>(Component);
+		if (Scene && Scene->GetName().StartsWith(Prefix))
+		{
+			return Scene;
+		}
+	}
+
+	return nullptr;
+}
+
+float UNexusAbilityUILibrary::TickChestLid(AActor* Chest, FName PivotName, float CurrentRoll,
+	float TargetRoll, float Speed, float DeltaTime)
+{
+	USceneComponent* Pivot = FindChestPivot(Chest, PivotName);
+	if (!Pivot)
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("TickChestLid: %s has no scene component named %s"),
+			*GetNameSafe(Chest), *PivotName.ToString());
+		return CurrentRoll;
+	}
+
+	// FInterpTo eases out (exponential approach) and returns Target outright when Speed <= 0,
+	// which is the snap BeginPlay relies on to pose the lid closed on the first frame.
+	const float NewRoll = FMath::FInterpTo(CurrentRoll, TargetRoll, DeltaTime, Speed);
+
+	FRotator Rotation = Pivot->GetRelativeRotation();
+	Rotation.Roll = NewRoll;
+	Pivot->SetRelativeRotation(Rotation);
+
+	return NewRoll;
+}
+
+void UNexusAbilityUILibrary::PlayChestOpenFX(AActor* Chest, USoundBase* Sound, UParticleSystem* DustFX,
+	FName PivotName, float SoundPitch)
+{
+	if (!Chest)
+	{
+		return;
+	}
+
+	const USceneComponent* Pivot = FindChestPivot(Chest, PivotName);
+	const FVector FXLocation = Pivot ? Pivot->GetComponentLocation() : Chest->GetActorLocation();
+
+	if (Sound)
+	{
+		UGameplayStatics::PlaySoundAtLocation(Chest, Sound, Chest->GetActorLocation(), 1.f, SoundPitch);
+	}
+
+	if (DustFX)
+	{
+		UGameplayStatics::SpawnEmitterAtLocation(Chest, DustFX, FXLocation, FRotator::ZeroRotator, true);
+	}
 }
 
 int32 UNexusAbilityUILibrary::TakeAllLoot(AActor* Looter, UNarrativeInventoryComponent* Source,
