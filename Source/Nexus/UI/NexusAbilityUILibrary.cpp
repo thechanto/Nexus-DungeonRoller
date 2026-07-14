@@ -4,6 +4,7 @@
 
 #include "AbilitySystemComponent.h"
 #include "AbilitySystemInterface.h"
+#include "GameplayEffect.h"
 #include "Blueprint/UserWidget.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
 #include "Blueprint/WidgetTree.h"
@@ -21,6 +22,7 @@
 #include "Components/VerticalBox.h"
 #include "Components/VerticalBoxSlot.h"
 #include "Components/Widget.h"
+#include "Components/WidgetComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Materials/MaterialInterface.h"
 #include "Engine/GameInstance.h"
@@ -85,6 +87,21 @@ namespace
 			return Cast<T>(Prop->GetObjectPropertyValue(Prop->ContainerPtrToValuePtr<void>(Ptr)));
 		}
 		return nullptr;
+	}
+
+	/**
+	 * Writes a class-reference Blueprint variable (e.g. BP_BasicItemPickup's "Item Class").
+	 * A TSubclassOf variable is an FClassProperty, which FObjectPropertyBase covers, so this is
+	 * separate from WriteNumericField only because the value is a UClass rather than a number.
+	 */
+	bool WriteClassField(const UStruct* Owner, void* Ptr, const TCHAR* Name, UClass* Value)
+	{
+		if (FObjectPropertyBase* Prop = CastField<FObjectPropertyBase>(FindPropByDisplayName(Owner, Name)))
+		{
+			Prop->SetObjectPropertyValue(Prop->ContainerPtrToValuePtr<void>(Ptr), Value);
+			return true;
+		}
+		return false;
 	}
 
 	/** Reads a struct Blueprint variable (FVector / FLinearColor) by value. */
@@ -230,6 +247,55 @@ namespace
 			{
 				Prop->SetIntPropertyValue(ValuePtr, static_cast<int64>(Value));
 			}
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Reads an enum-valued Blueprint variable as a bare index. Enum variables come in two shapes and
+	 * only one of them is numeric: a C++ "enum class : uint8" lands as an FEnumProperty (which is NOT
+	 * an FNumericProperty, so ReadNumericField misses it entirely and reports the variable as absent),
+	 * while a Blueprint user-defined enum such as E_PotionType lands as an FByteProperty (which is).
+	 * Both are handled here, so callers never have to care which kind an enum happens to be.
+	 */
+	bool ReadEnumIndexField(const UStruct* Owner, const void* Ptr, const TCHAR* Name, int64& OutIndex)
+	{
+		FProperty* Prop = FindPropByDisplayName(Owner, Name);
+		if (!Prop)
+		{
+			return false;
+		}
+		if (const FEnumProperty* EnumProp = CastField<FEnumProperty>(Prop))
+		{
+			OutIndex = EnumProp->GetUnderlyingProperty()->GetSignedIntPropertyValue(
+				EnumProp->ContainerPtrToValuePtr<void>(Ptr));
+			return true;
+		}
+		if (const FNumericProperty* NumProp = CastField<FNumericProperty>(Prop))
+		{
+			OutIndex = NumProp->GetSignedIntPropertyValue(NumProp->ContainerPtrToValuePtr<void>(Ptr));
+			return true;
+		}
+		return false;
+	}
+
+	bool WriteEnumIndexField(const UStruct* Owner, void* Ptr, const TCHAR* Name, int64 Index)
+	{
+		FProperty* Prop = FindPropByDisplayName(Owner, Name);
+		if (!Prop)
+		{
+			return false;
+		}
+		if (const FEnumProperty* EnumProp = CastField<FEnumProperty>(Prop))
+		{
+			EnumProp->GetUnderlyingProperty()->SetIntPropertyValue(
+				EnumProp->ContainerPtrToValuePtr<void>(Ptr), Index);
+			return true;
+		}
+		if (FNumericProperty* NumProp = CastField<FNumericProperty>(Prop))
+		{
+			NumProp->SetIntPropertyValue(NumProp->ContainerPtrToValuePtr<void>(Ptr), Index);
 			return true;
 		}
 		return false;
@@ -2358,22 +2424,381 @@ bool UNexusAbilityUILibrary::UpdateGoldDisplay(const UObject* WorldContextObject
 	return bFound;
 }
 
-bool UNexusAbilityUILibrary::GrantPotion(AActor* PlayerActor, int32 Count)
+namespace
+{
+	/**
+	 * Everything that differs between one potion type and the next, in one table. The strings are
+	 * BP_NexusPlayer variable names, resolved by reflection -- FindPropByDisplayName trims, so the
+	 * authored names' trailing spaces ("HealthPotionCount ", "ManaPotionCount ") do not matter here.
+	 * Indexed by ENexusPotionType, so a new potion is one row plus one enumerator, not a new graph.
+	 */
+	struct FPotionFields
+	{
+		const TCHAR* CountField;
+		const TCHAR* ChargesField;
+		const TCHAR* SipField;
+		const TCHAR* EffectField;
+		const TCHAR* ItemPath;
+		const TCHAR* DisplayName;
+	};
+
+	const FPotionFields GPotionFields[] =
+	{
+		// Health
+		{ TEXT("HealthPotionCount"), TEXT("HealthPotionCharges"), TEXT("HealAmountPerSip"),
+		  TEXT("HealthPotionEffect"), TEXT("/Game/Inventory/Items/BP_Item_HealthPotion.BP_Item_HealthPotion_C"),
+		  TEXT("health") },
+		// Mana
+		{ TEXT("ManaPotionCount"), TEXT("ManaPotionCharges"), TEXT("ManaAmountPerSip"),
+		  TEXT("ManaPotionEffect"), TEXT("/Game/Inventory/Items/BP_Item_ManaPotion.BP_Item_ManaPotion_C"),
+		  TEXT("mana") },
+	};
+
+	constexpr int32 GPotionTypeCount = static_cast<int32>(UE_ARRAY_COUNT(GPotionFields));
+
+	const FPotionFields& PotionFields(ENexusPotionType Type)
+	{
+		const int32 Index = static_cast<int32>(Type);
+		return GPotionFields[FMath::Clamp(Index, 0, GPotionTypeCount - 1)];
+	}
+
+	/** A full flask, when BP_NexusPlayer does not say otherwise. */
+	constexpr float GPotionDefaultMaxCharges = 100.0f;
+	/** Charge drained per 1s tick, when BP_NexusPlayer's PotionDrainRate is unset. */
+	constexpr float GPotionDefaultDrainRate = 25.0f;
+	/** The magnitude both restore effects read; mana reuses the health tag rather than minting one. */
+	const FName GPotionSetByCallerTag(TEXT("Data.Heal"));
+
+	float PotionMaxCharges(const AActor* Player)
+	{
+		double Max = 0.0;
+		if (ReadNumericField(Player->GetClass(), Player, TEXT("PotionMaxCharges"), Max) && Max > 0.0)
+		{
+			return static_cast<float>(Max);
+		}
+		return GPotionDefaultMaxCharges;
+	}
+
+	float PotionDrainRate(const AActor* Player)
+	{
+		double Rate = 0.0;
+		if (ReadNumericField(Player->GetClass(), Player, TEXT("PotionDrainRate"), Rate) && Rate > 0.0)
+		{
+			return static_cast<float>(Rate);
+		}
+		return GPotionDefaultDrainRate;
+	}
+
+	/**
+	 * BP_NexusPlayer's "SelectedPotionType" is typed as the Blueprint enum E_PotionType, which the
+	 * engine may store as either a bare byte or an FEnumProperty depending on how it was authored.
+	 * Both are read here as a plain index, which is the whole reason ENexusPotionType's enumerator
+	 * order has to match E_PotionType's.
+	 */
+	ENexusPotionType ReadSelectedPotionType(const AActor* Player)
+	{
+		int64 Index = 0;
+		if (!Player || !ReadEnumIndexField(Player->GetClass(), Player, TEXT("SelectedPotionType"), Index))
+		{
+			return ENexusPotionType::Health;
+		}
+		const int32 Clamped = FMath::Clamp(static_cast<int32>(Index), 0, GPotionTypeCount - 1);
+		return static_cast<ENexusPotionType>(Clamped);
+	}
+
+	/**
+	 * The one in-flight drink. Held here rather than in a Blueprint FTimerHandle variable because
+	 * the GE handle has to be remembered too: removing the effect by handle is exact, where removing
+	 * it by source class would also strip an identical effect applied by anything else.
+	 */
+	struct FPotionDrink
+	{
+		FTimerHandle Timer;
+		FActiveGameplayEffectHandle Effect;
+		ENexusPotionType Type = ENexusPotionType::Health;
+	};
+	TMap<TWeakObjectPtr<AActor>, FPotionDrink> GActiveDrinks;
+
+	/** Defined below StartPotion, which is where the drain timer that calls it is armed. */
+	void TickPotionDrainImpl(AActor* Player);
+
+	UAbilitySystemComponent* FindASC(AActor* Actor)
+	{
+		if (const IAbilitySystemInterface* AsInterface = Cast<IAbilitySystemInterface>(Actor))
+		{
+			return AsInterface->GetAbilitySystemComponent();
+		}
+		return nullptr;
+	}
+}
+
+ENexusPotionType UNexusAbilityUILibrary::GetSelectedPotionType(AActor* PlayerActor)
+{
+	return ReadSelectedPotionType(PlayerActor);
+}
+
+int32 UNexusAbilityUILibrary::GetPotionCount(AActor* PlayerActor, ENexusPotionType PotionType)
+{
+	double Count = 0.0;
+	if (!PlayerActor ||
+		!ReadNumericField(PlayerActor->GetClass(), PlayerActor, PotionFields(PotionType).CountField, Count))
+	{
+		return 0;
+	}
+	return static_cast<int32>(Count);
+}
+
+bool UNexusAbilityUILibrary::SetPotionCount(AActor* PlayerActor, ENexusPotionType PotionType, int32 NewCount)
 {
 	if (!PlayerActor)
 	{
 		return false;
 	}
-	double PotionCount = 0.0;
-	if (!ReadNumericField(PlayerActor->GetClass(), PlayerActor, TEXT("HealthPotionCount"), PotionCount))
+	return WriteNumericField(PlayerActor->GetClass(), PlayerActor,
+		PotionFields(PotionType).CountField, FMath::Max(0, NewCount));
+}
+
+float UNexusAbilityUILibrary::GetPotionCharges(AActor* PlayerActor, ENexusPotionType PotionType)
+{
+	double Charges = 0.0;
+	if (!PlayerActor ||
+		!ReadNumericField(PlayerActor->GetClass(), PlayerActor, PotionFields(PotionType).ChargesField, Charges))
 	{
-		UE_LOG(LogNexusAbilityUI, Warning, TEXT("GrantPotion: %s has no HealthPotionCount variable"),
-			*PlayerActor->GetClass()->GetName());
+		return 0.0f;
+	}
+	return static_cast<float>(Charges);
+}
+
+bool UNexusAbilityUILibrary::SetPotionCharges(AActor* PlayerActor, ENexusPotionType PotionType, float NewCharges)
+{
+	if (!PlayerActor)
+	{
 		return false;
 	}
-	WriteNumericField(PlayerActor->GetClass(), PlayerActor, TEXT("HealthPotionCount"), PotionCount + Count);
-	UE_LOG(LogNexusAbilityUI, Log, TEXT("GrantPotion: %s now has %d potion(s)"),
-		*PlayerActor->GetName(), static_cast<int32>(PotionCount) + Count);
+	return WriteNumericField(PlayerActor->GetClass(), PlayerActor, PotionFields(PotionType).ChargesField,
+		FMath::Clamp(NewCharges, 0.0f, PotionMaxCharges(PlayerActor)));
+}
+
+int32 UNexusAbilityUILibrary::GetSelectedPotionCount(AActor* PlayerActor)
+{
+	return GetPotionCount(PlayerActor, ReadSelectedPotionType(PlayerActor));
+}
+
+float UNexusAbilityUILibrary::GetSelectedPotionChargePercent(AActor* PlayerActor)
+{
+	if (!PlayerActor)
+	{
+		return 0.0f;
+	}
+	const float Max = PotionMaxCharges(PlayerActor);
+	if (Max <= 0.0f)
+	{
+		return 0.0f;
+	}
+	return FMath::Clamp(GetPotionCharges(PlayerActor, ReadSelectedPotionType(PlayerActor)) / Max, 0.0f, 1.0f);
+}
+
+TSubclassOf<UGameplayEffect> UNexusAbilityUILibrary::GetPotionEffectClass(AActor* PlayerActor,
+	ENexusPotionType PotionType)
+{
+	if (!PlayerActor)
+	{
+		return nullptr;
+	}
+	const FPotionFields& Fields = PotionFields(PotionType);
+
+	// The effect lives on a BP_NexusPlayer class-reference variable so it stays a cook dependency
+	// of the player Blueprint. Class properties come in two flavours depending on whether the
+	// variable was authored as a hard or soft class reference, so both are handled.
+	if (const FClassProperty* ClassProp = CastField<FClassProperty>(
+		FindPropByDisplayName(PlayerActor->GetClass(), Fields.EffectField)))
+	{
+		if (UClass* Effect = Cast<UClass>(
+			ClassProp->GetObjectPropertyValue(ClassProp->ContainerPtrToValuePtr<void>(PlayerActor))))
+		{
+			return Effect;
+		}
+	}
+	if (const FSoftClassProperty* SoftProp = CastField<FSoftClassProperty>(
+		FindPropByDisplayName(PlayerActor->GetClass(), Fields.EffectField)))
+	{
+		const FSoftObjectPtr& Soft = SoftProp->GetPropertyValue(
+			SoftProp->ContainerPtrToValuePtr<void>(PlayerActor));
+		if (UClass* Effect = Cast<UClass>(Soft.LoadSynchronous()))
+		{
+			return Effect;
+		}
+	}
+
+	UE_LOG(LogNexusAbilityUI, Warning, TEXT("GetPotionEffectClass: %s has no %s variable set"),
+		*PlayerActor->GetClass()->GetName(), Fields.EffectField);
+	return nullptr;
+}
+
+float UNexusAbilityUILibrary::GetPotionSipAmount(AActor* PlayerActor, ENexusPotionType PotionType)
+{
+	double Amount = 0.0;
+	if (!PlayerActor ||
+		!ReadNumericField(PlayerActor->GetClass(), PlayerActor, PotionFields(PotionType).SipField, Amount))
+	{
+		return 0.0f;
+	}
+	return static_cast<float>(Amount);
+}
+
+bool UNexusAbilityUILibrary::StartPotion(AActor* PlayerActor, ENexusPotionType PotionType)
+{
+	if (!PlayerActor)
+	{
+		return false;
+	}
+	UWorld* World = PlayerActor->GetWorld();
+	UAbilitySystemComponent* ASC = FindASC(PlayerActor);
+	if (!World || !ASC)
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("StartPotion: no world/ASC on %s"), *PlayerActor->GetName());
+		return false;
+	}
+
+	const FPotionFields& Fields = PotionFields(PotionType);
+	if (GetPotionCount(PlayerActor, PotionType) <= 0)
+	{
+		UE_LOG(LogNexusAbilityUI, Verbose, TEXT("StartPotion: %s holds no %s potion"),
+			*PlayerActor->GetName(), Fields.DisplayName);
+		return false;
+	}
+
+	TSubclassOf<UGameplayEffect> EffectClass = GetPotionEffectClass(PlayerActor, PotionType);
+	if (!EffectClass)
+	{
+		return false;
+	}
+
+	// Swapping type mid-drink (Q while F is held) must not leave the first effect running.
+	StopPotion(PlayerActor);
+
+	FGameplayEffectContextHandle Context = ASC->MakeEffectContext();
+	Context.AddSourceObject(PlayerActor);
+	FGameplayEffectSpecHandle Spec = ASC->MakeOutgoingSpec(EffectClass, 1.0f, Context);
+	if (!Spec.IsValid())
+	{
+		return false;
+	}
+	Spec.Data->SetSetByCallerMagnitude(FGameplayTag::RequestGameplayTag(GPotionSetByCallerTag),
+		GetPotionSipAmount(PlayerActor, PotionType));
+
+	FPotionDrink Drink;
+	Drink.Type = PotionType;
+	Drink.Effect = ASC->ApplyGameplayEffectSpecToSelf(*Spec.Data.Get());
+
+	const TWeakObjectPtr<AActor> WeakPlayer(PlayerActor);
+	World->GetTimerManager().SetTimer(Drink.Timer, FTimerDelegate::CreateLambda(
+		[WeakPlayer]()
+		{
+			if (AActor* Player = WeakPlayer.Get())
+			{
+				TickPotionDrainImpl(Player);
+			}
+		}), 1.0f, /*bLoop*/ true);
+
+	GActiveDrinks.Add(WeakPlayer, Drink);
+	UE_LOG(LogNexusAbilityUI, Log, TEXT("StartPotion: %s drinking %s (%d left)"),
+		*PlayerActor->GetName(), Fields.DisplayName, GetPotionCount(PlayerActor, PotionType));
+	return true;
+}
+
+void UNexusAbilityUILibrary::StopPotion(AActor* PlayerActor)
+{
+	if (!PlayerActor)
+	{
+		return;
+	}
+	const TWeakObjectPtr<AActor> WeakPlayer(PlayerActor);
+	FPotionDrink Drink;
+	if (!GActiveDrinks.RemoveAndCopyValue(WeakPlayer, Drink))
+	{
+		return;
+	}
+
+	if (UWorld* World = PlayerActor->GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(Drink.Timer);
+	}
+	if (UAbilitySystemComponent* ASC = FindASC(PlayerActor))
+	{
+		ASC->RemoveActiveGameplayEffect(Drink.Effect);
+	}
+
+	// Stale entries would otherwise pile up across a PIE session: a player who dies mid-drink is
+	// destroyed without ever releasing F, so nothing clears its row.
+	for (auto It = GActiveDrinks.CreateIterator(); It; ++It)
+	{
+		if (!It.Key().IsValid())
+		{
+			It.RemoveCurrent();
+		}
+	}
+}
+
+namespace
+{
+	/**
+	 * One second of drinking. Drains the current flask; when it runs dry, that flask is spent, so
+	 * the count drops and the next one is poured. Draining the last flask ends the drink.
+	 *
+	 * The old Blueprint chain decremented the count and refilled charges to 100 unconditionally,
+	 * so drinking the final flask left the player on count 0 with a full bar and the stop test
+	 * (count <= 0 AND charges <= 0) never fired -- the count went negative on the tick after. The
+	 * count is floored at zero here and the refill only happens when a flask actually remains.
+	 */
+	void TickPotionDrainImpl(AActor* Player)
+	{
+		const FPotionDrink* Drink = GActiveDrinks.Find(TWeakObjectPtr<AActor>(Player));
+		if (!Drink)
+		{
+			return;
+		}
+		const ENexusPotionType Type = Drink->Type;
+		const float Max = PotionMaxCharges(Player);
+
+		float Charges = UNexusAbilityUILibrary::GetPotionCharges(Player, Type) - PotionDrainRate(Player);
+		if (Charges > 0.0f)
+		{
+			UNexusAbilityUILibrary::SetPotionCharges(Player, Type, Charges);
+			return;
+		}
+
+		// Flask empty: spend it.
+		const int32 Remaining = FMath::Max(0, UNexusAbilityUILibrary::GetPotionCount(Player, Type) - 1);
+		UNexusAbilityUILibrary::SetPotionCount(Player, Type, Remaining);
+
+		if (Remaining > 0)
+		{
+			UNexusAbilityUILibrary::SetPotionCharges(Player, Type, Max);
+			return;
+		}
+		UNexusAbilityUILibrary::SetPotionCharges(Player, Type, 0.0f);
+		UNexusAbilityUILibrary::StopPotion(Player);
+	}
+}
+
+bool UNexusAbilityUILibrary::GrantPotion(AActor* PlayerActor, int32 Count, ENexusPotionType PotionType)
+{
+	if (!PlayerActor)
+	{
+		return false;
+	}
+	const FPotionFields& Fields = PotionFields(PotionType);
+	double PotionCount = 0.0;
+	if (!ReadNumericField(PlayerActor->GetClass(), PlayerActor, Fields.CountField, PotionCount))
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("GrantPotion: %s has no %s variable"),
+			*PlayerActor->GetClass()->GetName(), Fields.CountField);
+		return false;
+	}
+	WriteNumericField(PlayerActor->GetClass(), PlayerActor, Fields.CountField, PotionCount + Count);
+	UE_LOG(LogNexusAbilityUI, Log, TEXT("GrantPotion: %s now has %d %s potion(s)"),
+		*PlayerActor->GetName(), static_cast<int32>(PotionCount) + Count, Fields.DisplayName);
 	return true;
 }
 
@@ -2428,19 +2853,104 @@ namespace
 		return true;
 	}
 
+	/** Of the drops that are not gold, how many are mana rather than health. */
+	constexpr float GManaPotionShare = 0.5f;
+
+	/** Everything that differs between one drop type and the next, indexed by ENexusLootType. */
+	struct FLootFields
+	{
+		const TCHAR* MeshField;
+		const TCHAR* MaterialField;
+		const TCHAR* ScaleField;
+		const TCHAR* ColourField;
+		const TCHAR* ItemPath;
+		const TCHAR* DisplayName;
+	};
+
+	const FLootFields GLootFields[] =
+	{
+		// Gold
+		{ TEXT("GoldMesh"), TEXT("GoldMaterial"), TEXT("GoldScale"), TEXT("GoldLightColor"),
+		  TEXT("/Game/Inventory/Items/BP_Item_Gold.BP_Item_Gold_C"), TEXT("gold") },
+		// HealthPotion
+		{ TEXT("PotionMesh"), TEXT("PotionMaterial"), TEXT("PotionScale"), TEXT("PotionLightColor"),
+		  TEXT("/Game/Inventory/Items/BP_Item_HealthPotion.BP_Item_HealthPotion_C"), TEXT("health potion") },
+		// ManaPotion
+		{ TEXT("ManaPotionMesh"), TEXT("ManaPotionMaterial"), TEXT("ManaPotionScale"), TEXT("ManaPotionLightColor"),
+		  TEXT("/Game/Inventory/Items/BP_Item_ManaPotion.BP_Item_ManaPotion_C"), TEXT("mana potion") },
+		// Weapon -- reserved. Styled off the potion fields until it has its own; never rolled.
+		{ TEXT("PotionMesh"), TEXT("PotionMaterial"), TEXT("PotionScale"), TEXT("PotionLightColor"),
+		  nullptr, TEXT("weapon") },
+	};
+
+	constexpr int32 GLootTypeCount = static_cast<int32>(UE_ARRAY_COUNT(GLootFields));
+
+	const FLootFields& LootFields(ENexusLootType Type)
+	{
+		const int32 Index = static_cast<int32>(Type);
+		return GLootFields[FMath::Clamp(Index, 0, GLootTypeCount - 1)];
+	}
+
+	/** Which potion a drop that has already been decided to be a potion turns out to be. */
+	ENexusLootType RollPotionLootType()
+	{
+		return (FMath::FRand() < GManaPotionShare) ? ENexusLootType::ManaPotion : ENexusLootType::HealthPotion;
+	}
+
+	/**
+	 * A pickup's type. Reads BP_LootPickup's "LootType" variable, and falls back to the bool it
+	 * replaced: the C++ ships before the Blueprint variable is added, and a pickup saved with only
+	 * the old bIsGold must still resolve to something sane rather than silently reading as gold.
+	 */
+	ENexusLootType ReadLootType(const AActor* Pickup)
+	{
+		const UClass* PickupClass = Pickup->GetClass();
+		int64 Index = 0;
+		if (ReadEnumIndexField(PickupClass, Pickup, TEXT("LootType"), Index))
+		{
+			return static_cast<ENexusLootType>(
+				FMath::Clamp(static_cast<int32>(Index), 0, GLootTypeCount - 1));
+		}
+		if (const FBoolProperty* GoldProp = CastField<FBoolProperty>(
+			FindPropByDisplayName(PickupClass, TEXT("bIsGold"))))
+		{
+			return GoldProp->GetPropertyValue(GoldProp->ContainerPtrToValuePtr<void>(Pickup))
+				? ENexusLootType::Gold
+				: ENexusLootType::HealthPotion;
+		}
+		return ENexusLootType::Gold;
+	}
+
+	/** Mirror of ReadLootType: writes the enum where it can, the legacy bool where it must. */
+	void WriteLootType(AActor* Pickup, ENexusLootType Type)
+	{
+		const UClass* PickupClass = Pickup->GetClass();
+		if (WriteEnumIndexField(PickupClass, Pickup, TEXT("LootType"), static_cast<int64>(Type)))
+		{
+			return;
+		}
+		if (FBoolProperty* GoldProp = CastField<FBoolProperty>(
+			FindPropByDisplayName(PickupClass, TEXT("bIsGold"))))
+		{
+			GoldProp->SetPropertyValue(GoldProp->ContainerPtrToValuePtr<void>(Pickup),
+				Type == ENexusLootType::Gold);
+		}
+	}
+
 	/**
 	 * Applies BP_LootPickup's per-type look to a spawned pickup, reading the mesh, material, scale
 	 * and light colour straight off the Blueprint's own variables (GoldMesh / PotionMesh / ...).
 	 * Keeping the assets on the Blueprint rather than in string paths here is what makes them real
 	 * cook dependencies of BP_LootPickup -- a LoadObject path cooks to nothing in a packaged build.
 	 */
-	void ApplyLootPickupStyle(AActor* Pickup, bool bIsGold)
+	void ApplyLootPickupStyle(AActor* Pickup, ENexusLootType Type)
 	{
 		const UClass* PickupClass = Pickup->GetClass();
-		const TCHAR* MeshField     = bIsGold ? TEXT("GoldMesh")       : TEXT("PotionMesh");
-		const TCHAR* MaterialField = bIsGold ? TEXT("GoldMaterial")   : TEXT("PotionMaterial");
-		const TCHAR* ScaleField    = bIsGold ? TEXT("GoldScale")      : TEXT("PotionScale");
-		const TCHAR* ColourField   = bIsGold ? TEXT("GoldLightColor") : TEXT("PotionLightColor");
+		const FLootFields& Fields = LootFields(Type);
+		const TCHAR* MeshField     = Fields.MeshField;
+		const TCHAR* MaterialField = Fields.MaterialField;
+		const TCHAR* ScaleField    = Fields.ScaleField;
+		const TCHAR* ColourField   = Fields.ColourField;
 
 		if (UStaticMeshComponent* MeshComp = Pickup->FindComponentByClass<UStaticMeshComponent>())
 		{
@@ -2490,35 +3000,37 @@ void UNexusAbilityUILibrary::HandleLootPickup(AActor* Pickup, AActor* OtherActor
 		return;
 	}
 
-	bool bIsGold = true;
-	if (const FBoolProperty* GoldProp = CastField<FBoolProperty>(
-		FindPropByDisplayName(Pickup->GetClass(), TEXT("bIsGold"))))
-	{
-		bIsGold = GoldProp->GetPropertyValue(GoldProp->ContainerPtrToValuePtr<void>(Pickup));
-	}
+	const ENexusLootType LootType = ReadLootType(Pickup);
+	const FLootFields& Fields = LootFields(LootType);
 
 	// Pickups now flow into the run inventory as Narrative items instead of the save-int gold
 	// / flask-count. Run loot is lost on death and banked only on extraction (see
 	// ExtractRunInventoryToStash). Drinking a potion from the inventory still feeds the flask
-	// via BP_Item_HealthPotion's OnUse, so the F-key flow is unaffected.
+	// via the item's OnUse, so the F-key flow is unaffected.
 	UNarrativeInventoryComponent* RunInventory = FindPlayerInventory(OtherActor, FName(TEXT("RunInventory")));
 	if (RunInventory)
 	{
-		if (bIsGold)
+		if (LootType == ENexusLootType::Gold)
 		{
 			double GoldAmount = 10.0;
 			ReadNumericField(Pickup->GetClass(), Pickup, TEXT("GoldAmount"), GoldAmount);
-			if (UClass* GoldClass = LoadClass<UNarrativeItem>(nullptr,
-				TEXT("/Game/Inventory/Items/BP_Item_Gold.BP_Item_Gold_C")))
+			if (UClass* GoldClass = LoadClass<UNarrativeItem>(nullptr, Fields.ItemPath))
 			{
 				RunInventory->TryAddItemFromClass(GoldClass, static_cast<int32>(GoldAmount), /*bCheckAutoUse*/ false);
 			}
 			UpdateGoldDisplay(OtherActor);
 		}
-		else if (UClass* PotionClass = LoadClass<UNarrativeItem>(nullptr,
-			TEXT("/Game/Inventory/Items/BP_Item_HealthPotion.BP_Item_HealthPotion_C")))
+		else if (Fields.ItemPath)
 		{
-			RunInventory->TryAddItemFromClass(PotionClass, 1, /*bCheckAutoUse*/ false);
+			if (UClass* PotionClass = LoadClass<UNarrativeItem>(nullptr, Fields.ItemPath))
+			{
+				RunInventory->TryAddItemFromClass(PotionClass, 1, /*bCheckAutoUse*/ false);
+			}
+			else
+			{
+				UE_LOG(LogNexusAbilityUI, Warning, TEXT("HandleLootPickup: %s item class failed to load (%s)"),
+					Fields.DisplayName, Fields.ItemPath);
+			}
 		}
 	}
 	else
@@ -2555,7 +3067,13 @@ AActor* UNexusAbilityUILibrary::SpawnLootDrop(AActor* DeadEnemy, float DropChanc
 		return nullptr;
 	}
 
-	const bool bIsGold = FMath::FRand() < GoldShare;
+	// Two stages: gold or a potion, and then which potion. Rolling the type separately keeps the
+	// gold/potion balance exactly where it was when mana potions were added -- a flat three-way
+	// roll would have quietly cut the gold rate.
+	const ENexusLootType LootType = (FMath::FRand() < GoldShare)
+		? ENexusLootType::Gold
+		: RollPotionLootType();
+
 	const FTransform SpawnTransform(DeadEnemy->GetActorLocation() + FVector(0.0f, 0.0f, 50.0f));
 	AActor* Pickup = World->SpawnActorDeferred<AActor>(PickupClass, SpawnTransform, nullptr, nullptr,
 		ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
@@ -2564,11 +3082,7 @@ AActor* UNexusAbilityUILibrary::SpawnLootDrop(AActor* DeadEnemy, float DropChanc
 		return nullptr;
 	}
 
-	if (FBoolProperty* GoldProp = CastField<FBoolProperty>(
-		FindPropByDisplayName(PickupClass, TEXT("bIsGold"))))
-	{
-		GoldProp->SetPropertyValue(GoldProp->ContainerPtrToValuePtr<void>(Pickup), bIsGold);
-	}
+	WriteLootType(Pickup, LootType);
 
 	UGameplayStatics::FinishSpawningActor(Pickup, SpawnTransform);
 
@@ -2577,10 +3091,287 @@ AActor* UNexusAbilityUILibrary::SpawnLootDrop(AActor* DeadEnemy, float DropChanc
 	// HandleLootPickup defers the collect, so the pickup is still alive to be styled here.
 	if (IsValid(Pickup))
 	{
-		ApplyLootPickupStyle(Pickup, bIsGold);
+		ApplyLootPickupStyle(Pickup, LootType);
 	}
 	UE_LOG(LogNexusAbilityUI, Log, TEXT("SpawnLootDrop: dropped %s from %s"),
-		bIsGold ? TEXT("gold") : TEXT("potion"), *DeadEnemy->GetName());
+		LootFields(LootType).DisplayName, *DeadEnemy->GetName());
+	return Pickup;
+}
+
+namespace
+{
+	/** How far in front of the player a dropped item lands: clear of the capsule, still in reach. */
+	constexpr float DropForwardOffset = 150.0f;
+
+	/** Backed off a wall the drop would otherwise land inside. */
+	constexpr float DropWallClearance = 20.0f;
+
+	/** How far below the drop point to look for a floor before giving up and leaving it in the air. */
+	constexpr float DropFloorTraceDistance = 500.0f;
+
+	/** Where a drop from Dropper should land: in front, not through a wall, resting on the floor. */
+	FVector FindDropLocation(const AActor* Dropper, UWorld* World)
+	{
+		const FVector Start = Dropper->GetActorLocation();
+		const FVector Forward = Dropper->GetActorForwardVector();
+		FVector Target = Start + Forward * DropForwardOffset;
+
+		FCollisionQueryParams Params(FName(TEXT("SpawnDroppedItem")), /*bTraceComplex*/ false, Dropper);
+
+		// Drop against a wall the player is facing, not through it.
+		FHitResult WallHit;
+		if (World->LineTraceSingleByChannel(WallHit, Start, Target, ECC_Visibility, Params))
+		{
+			Target = WallHit.ImpactPoint - Forward * DropWallClearance;
+		}
+
+		// The player's location is the capsule centre, so without this the item hangs at chest height.
+		FHitResult FloorHit;
+		const FVector FloorEnd = Target - FVector(0.0f, 0.0f, DropFloorTraceDistance);
+		if (World->LineTraceSingleByChannel(FloorHit, Target, FloorEnd, ECC_Visibility, Params))
+		{
+			return FloorHit.ImpactPoint + FVector(0.0f, 0.0f, DropWallClearance);
+		}
+		return Target;
+	}
+
+	/** Ours, not the plugin's BP_BasicItemPickup: E-interact, no overlap grant. */
+	const TCHAR* DroppedItemPickupPath = TEXT("/Game/Loot/BP_DroppedItemPickup.BP_DroppedItemPickup_C");
+
+	/**
+	 * The item class a dropped pickup is holding. Tries both spellings: our BP_DroppedItemPickup
+	 * names it "ItemClass", while the plugin's BP_BasicItemPickup spells it "Item Class".
+	 */
+	UClass* ReadDroppedItemClass(const AActor* Pickup)
+	{
+		if (UClass* Found = ReadObjectField<UClass>(Pickup->GetClass(), Pickup, TEXT("ItemClass")))
+		{
+			return Found;
+		}
+		return ReadObjectField<UClass>(Pickup->GetClass(), Pickup, TEXT("Item Class"));
+	}
+
+	/** How many the pickup is still holding. Falls back to 1 so a missing variable never grants zero. */
+	int32 ReadDroppedItemQuantity(const AActor* Pickup)
+	{
+		double Quantity = 1.0;
+		ReadNumericField(Pickup->GetClass(), Pickup, TEXT("QuantityToGive"), Quantity);
+		return FMath::Max(1, static_cast<int32>(Quantity));
+	}
+
+	/**
+	 * The pickup's prompt widget. The widget component creates its user widget lazily, so a
+	 * pickup styled in the same frame it spawned can beat it to it -- InitWidget forces it.
+	 */
+	UUserWidget* FindPromptWidget(AActor* Pickup)
+	{
+		UWidgetComponent* PromptComponent = Pickup->FindComponentByClass<UWidgetComponent>();
+		if (!PromptComponent)
+		{
+			return nullptr;
+		}
+		if (!PromptComponent->GetUserWidgetObject())
+		{
+			PromptComponent->InitWidget();
+		}
+		return PromptComponent->GetUserWidgetObject();
+	}
+}
+
+bool UNexusAbilityUILibrary::RefreshDroppedItemPrompt(AActor* Pickup)
+{
+	if (!Pickup)
+	{
+		return false;
+	}
+	UClass* ItemClass = ReadDroppedItemClass(Pickup);
+	const UNarrativeItem* Item = ItemClass ? ItemClass->GetDefaultObject<UNarrativeItem>() : nullptr;
+	if (!Item)
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("RefreshDroppedItemPrompt: %s holds no item class"),
+			*GetNameSafe(Pickup));
+		return false;
+	}
+
+	UUserWidget* Prompt = FindPromptWidget(Pickup);
+	if (!Prompt || !Prompt->WidgetTree)
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("RefreshDroppedItemPrompt: %s has no prompt widget"),
+			*GetNameSafe(Pickup));
+		return false;
+	}
+
+	// W_InteractPrompt is a single label ("[E] Extract"), so the first TextBlock is the whole prompt.
+	UTextBlock* Label = nullptr;
+	Prompt->WidgetTree->ForEachWidget([&Label](UWidget* Widget)
+	{
+		if (!Label)
+		{
+			Label = Cast<UTextBlock>(Widget);
+		}
+	});
+	if (!Label)
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("RefreshDroppedItemPrompt: no TextBlock in %s's prompt"),
+			*GetNameSafe(Pickup));
+		return false;
+	}
+
+	// Built from its code point rather than typed literally, so the label cannot be corrupted by
+	// this file's encoding surviving a round-trip through the tooling.
+	constexpr TCHAR MultiplicationSign = 0x00D7;
+
+	const int32 Quantity = ReadDroppedItemQuantity(Pickup);
+	const FString Name = Item->DisplayName.ToString();
+	Label->SetText(FText::FromString(Quantity > 1
+		? FString::Printf(TEXT("[E] %s %c%d"), *Name, MultiplicationSign, Quantity)
+		: FString::Printf(TEXT("[E] %s"), *Name)));
+	return true;
+}
+
+void UNexusAbilityUILibrary::SetDroppedItemPromptVisible(AActor* Pickup, bool bShow)
+{
+	if (!Pickup)
+	{
+		return;
+	}
+	if (UWidgetComponent* PromptComponent = Pickup->FindComponentByClass<UWidgetComponent>())
+	{
+		PromptComponent->SetVisibility(bShow);
+	}
+}
+
+bool UNexusAbilityUILibrary::TakeDroppedItem(AActor* Pickup, AActor* InteractingActor)
+{
+	if (!Pickup || Pickup->IsActorBeingDestroyed() || !Pickup->HasAuthority())
+	{
+		return false;
+	}
+	UClass* ItemClass = ReadDroppedItemClass(Pickup);
+	if (!ItemClass)
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("TakeDroppedItem: %s holds no item class"),
+			*GetNameSafe(Pickup));
+		return false;
+	}
+
+	UNarrativeInventoryComponent* RunInventory = FindPlayerInventory(InteractingActor, FName(TEXT("RunInventory")));
+	if (!RunInventory)
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("TakeDroppedItem: no RunInventory on %s"),
+			*GetNameSafe(InteractingActor));
+		return false;
+	}
+
+	const int32 Quantity = ReadDroppedItemQuantity(Pickup);
+	const FItemAddResult Result = RunInventory->TryAddItemFromClass(ItemClass, Quantity, /*bCheckAutoUse*/ false);
+	if (Result.AmountGiven <= 0)
+	{
+		// Full inventory (or a rejected item): leave the pickup standing rather than eat the item.
+		UE_LOG(LogNexusAbilityUI, Log, TEXT("TakeDroppedItem: %s took none of %d x %s (%s)"),
+			*GetNameSafe(InteractingActor), Quantity, *ItemClass->GetName(), *Result.ErrorText.ToString());
+		return false;
+	}
+
+	if (Result.AmountGiven < Quantity)
+	{
+		// Partial add: the pickup keeps what would not fit, and its label follows.
+		WriteNumericField(Pickup->GetClass(), Pickup, TEXT("QuantityToGive"), Quantity - Result.AmountGiven);
+		RefreshDroppedItemPrompt(Pickup);
+		UE_LOG(LogNexusAbilityUI, Log, TEXT("TakeDroppedItem: %s took %d of %d x %s, %d left on the ground"),
+			*GetNameSafe(InteractingActor), Result.AmountGiven, Quantity, *ItemClass->GetName(),
+			Quantity - Result.AmountGiven);
+		return true;
+	}
+
+	UE_LOG(LogNexusAbilityUI, Log, TEXT("TakeDroppedItem: %s took %d x %s"),
+		*GetNameSafe(InteractingActor), Result.AmountGiven, *ItemClass->GetName());
+	Pickup->Destroy();
+	return true;
+}
+
+TSubclassOf<UNarrativeItem> UNexusAbilityUILibrary::GetNarrativeItemClass(UNarrativeItem* Item)
+{
+	return Item ? Item->GetClass() : nullptr;
+}
+
+USoundBase* UNexusAbilityUILibrary::GetItemUseSound(UNarrativeItem* Item)
+{
+	return Item ? Item->UseSound : nullptr;
+}
+
+AActor* UNexusAbilityUILibrary::SpawnDroppedItem(AActor* PlayerActor, TSubclassOf<UNarrativeItem> ItemClass,
+	int32 Quantity)
+{
+	if (!PlayerActor || !ItemClass || Quantity <= 0)
+	{
+		return nullptr;
+	}
+
+	// The drop actions are driven from widgets, which may hand us either the pawn or the controller.
+	AActor* Dropper = PlayerActor;
+	if (const AController* Controller = Cast<AController>(PlayerActor))
+	{
+		if (APawn* ControlledPawn = Controller->GetPawn())
+		{
+			Dropper = ControlledPawn;
+		}
+	}
+
+	UWorld* World = Dropper->GetWorld();
+	UClass* PickupClass = LoadClass<AActor>(nullptr, DroppedItemPickupPath);
+	if (!World || !PickupClass)
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("SpawnDroppedItem: BP_DroppedItemPickup failed to load (%s)"),
+			DroppedItemPickupPath);
+		return nullptr;
+	}
+
+	const FTransform SpawnTransform(FRotator::ZeroRotator, FindDropLocation(Dropper, World));
+	AActor* Pickup = World->SpawnActorDeferred<AActor>(PickupClass, SpawnTransform, nullptr, nullptr,
+		ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+	if (!Pickup)
+	{
+		return nullptr;
+	}
+
+	// Set before FinishSpawningActor so the pickup's BeginPlay already knows what it is holding.
+	// Neither variable is exposed-on-spawn, but raw reflection does not care about that flag.
+	if (!WriteClassField(Pickup->GetClass(), Pickup, TEXT("ItemClass"), ItemClass) &&
+		!WriteClassField(Pickup->GetClass(), Pickup, TEXT("Item Class"), ItemClass))
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("SpawnDroppedItem: %s has no ItemClass variable"),
+			*PickupClass->GetName());
+	}
+	WriteNumericField(Pickup->GetClass(), Pickup, TEXT("QuantityToGive"), Quantity);
+
+	UGameplayStatics::FinishSpawningActor(Pickup, SpawnTransform);
+	if (!IsValid(Pickup))
+	{
+		return nullptr;
+	}
+
+	// The pickup's SCS components do not exist until FinishSpawningActor has run, so the mesh and
+	// the prompt are set here rather than above. BP_LootPickup resolves its own look from LootType;
+	// a dropped item can be any item, so its look comes from the item's own soft PickupMesh.
+	if (UStaticMeshComponent* MeshComponent = Pickup->FindComponentByClass<UStaticMeshComponent>())
+	{
+		if (UStaticMesh* Mesh = ItemClass->GetDefaultObject<UNarrativeItem>()->PickupMesh.LoadSynchronous())
+		{
+			MeshComponent->SetStaticMesh(Mesh);
+		}
+		else
+		{
+			UE_LOG(LogNexusAbilityUI, Warning, TEXT("SpawnDroppedItem: %s has no PickupMesh, drop is invisible"),
+				*ItemClass->GetName());
+		}
+	}
+
+	RefreshDroppedItemPrompt(Pickup);
+	SetDroppedItemPromptVisible(Pickup, false);
+
+	UE_LOG(LogNexusAbilityUI, Log, TEXT("SpawnDroppedItem: %s dropped %d x %s"),
+		*Dropper->GetName(), Quantity, *ItemClass->GetName());
 	return Pickup;
 }
 
@@ -2669,19 +3460,39 @@ bool UNexusAbilityUILibrary::PopulateContainerLoot(AActor* Container, int32 MinG
 		}
 	}
 
+	// Each potion rolls its own type, on the same split the enemy drops use, so a chest holding two
+	// potions can hold one of each. Rolling once for the whole stack would make mixed chests
+	// impossible and halve the number of chests that contain any health potion at all.
 	const int32 PotionAmount = FMath::RandRange(FMath::Max(0, MinPotions), FMath::Max(MinPotions, MaxPotions));
-	if (PotionAmount > 0)
+	int32 PotionsByType[2] = { 0, 0 };
+	for (int32 Rolled = 0; Rolled < PotionAmount; ++Rolled)
 	{
-		if (UClass* PotionClass = LoadClass<UNarrativeItem>(nullptr,
-			TEXT("/Game/Inventory/Items/BP_Item_HealthPotion.BP_Item_HealthPotion_C")))
+		const ENexusLootType Type = RollPotionLootType();
+		++PotionsByType[Type == ENexusLootType::ManaPotion ? 1 : 0];
+	}
+
+	const ENexusLootType PotionTypes[2] = { ENexusLootType::HealthPotion, ENexusLootType::ManaPotion };
+	for (int32 Index = 0; Index < 2; ++Index)
+	{
+		if (PotionsByType[Index] <= 0)
 		{
-			ChestInventory->TryAddItemFromClass(PotionClass, PotionAmount, /*bCheckAutoUse*/ false);
+			continue;
+		}
+		const FLootFields& Fields = LootFields(PotionTypes[Index]);
+		if (UClass* PotionClass = LoadClass<UNarrativeItem>(nullptr, Fields.ItemPath))
+		{
+			ChestInventory->TryAddItemFromClass(PotionClass, PotionsByType[Index], /*bCheckAutoUse*/ false);
 			bAddedAny = true;
+		}
+		else
+		{
+			UE_LOG(LogNexusAbilityUI, Warning, TEXT("PopulateContainerLoot: %s item class failed to load (%s)"),
+				Fields.DisplayName, Fields.ItemPath);
 		}
 	}
 
-	UE_LOG(LogNexusAbilityUI, Log, TEXT("PopulateContainerLoot: %s given %d gold, %d potion(s)"),
-		*GetNameSafe(Container), GoldAmount, PotionAmount);
+	UE_LOG(LogNexusAbilityUI, Log, TEXT("PopulateContainerLoot: %s given %d gold, %d health + %d mana potion(s)"),
+		*GetNameSafe(Container), GoldAmount, PotionsByType[0], PotionsByType[1]);
 	return bAddedAny;
 }
 

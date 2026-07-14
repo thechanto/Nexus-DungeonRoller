@@ -11,8 +11,35 @@
 class UButton;
 class UTextBlock;
 class UGameplayAbility;
+class UGameplayEffect;
 class UNexusAbilityPreviewController;
 class UNexusStatsPanel;
+
+/**
+ * Which flask the player is drinking. The enumerator ORDER must stay aligned with the
+ * Blueprint enum /Game/Potions/E_PotionType, because BP_NexusPlayer's "SelectedPotionType"
+ * variable is of that Blueprint type and is read here by index (see ReadSelectedPotionType).
+ * The two enums coexist on purpose: E_PotionType stays the player-facing selection type so
+ * the working Q-swap and HUD colour switches keep compiling untouched, while this one is what
+ * the C++ dispatch switches on. Adding a potion means adding it to BOTH, in the same slot.
+ */
+UENUM(BlueprintType)
+enum class ENexusPotionType : uint8
+{
+	Health = 0,
+	Mana   = 1
+};
+
+/** What a BP_LootPickup is. Replaces the old bIsGold bool, which could not express a third drop. */
+UENUM(BlueprintType)
+enum class ENexusLootType : uint8
+{
+	Gold         = 0,
+	HealthPotion = 1,
+	ManaPotion   = 2,
+	/** Reserved: weapon drops are next in the queue. Never rolled by SpawnLootDrop yet. */
+	Weapon       = 3
+};
 
 /**
  * UI helpers for the ability screen. Requirement data lives in Blueprint types
@@ -193,26 +220,163 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Nexus|Loot", meta = (WorldContext = "WorldContextObject"))
 	static bool UpdateGoldDisplay(const UObject* WorldContextObject);
 
-	/** Adds Count to PlayerActor's HealthPotionCount Blueprint variable (no cap exists). */
-	UFUNCTION(BlueprintCallable, Category = "Nexus|Loot")
-	static bool GrantPotion(AActor* PlayerActor, int32 Count = 1);
+	/**
+	 * Adds Count to PlayerActor's HealthPotionCount / ManaPotionCount Blueprint variable
+	 * (no cap exists). PotionType is last and defaults to Health so the existing
+	 * BP_Item_HealthPotion OnUse call site keeps compiling without a re-wire.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Loot", meta = (DefaultToSelf = "PlayerActor"))
+	static bool GrantPotion(AActor* PlayerActor, int32 Count = 1,
+		ENexusPotionType PotionType = ENexusPotionType::Health);
+
+	// --- Potion drinking -------------------------------------------------------------
+	//
+	// The whole drink path lives here rather than in parallel Blueprint graphs: one place
+	// decides which count, which charge pool, which sip amount and which GameplayEffect a
+	// potion type maps to (see the FPotionFields table in the .cpp). BP_NexusPlayer keeps
+	// the DATA -- the counts, the charges, the per-sip amounts and the effect classes are
+	// all Blueprint variables read by reflection, which is also what keeps the GameplayEffect
+	// assets real cook dependencies of BP_NexusPlayer. A LoadClass string path here would
+	// cook to nothing.
+
+	/** BP_NexusPlayer's "SelectedPotionType" (the Q-swap state), as the C++ enum. */
+	UFUNCTION(BlueprintPure, Category = "Nexus|Potions", meta = (DefaultToSelf = "PlayerActor"))
+	static ENexusPotionType GetSelectedPotionType(AActor* PlayerActor);
+
+	/** Flasks held of the given type. */
+	UFUNCTION(BlueprintPure, Category = "Nexus|Potions", meta = (DefaultToSelf = "PlayerActor"))
+	static int32 GetPotionCount(AActor* PlayerActor, ENexusPotionType PotionType);
+
+	/** Sets the flask count of the given type. Also how a PIE test hands the player mana potions. */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Potions", meta = (DefaultToSelf = "PlayerActor"))
+	static bool SetPotionCount(AActor* PlayerActor, ENexusPotionType PotionType, int32 NewCount);
+
+	/** Charge left in the current flask of the given type (0..PotionMaxCharges). */
+	UFUNCTION(BlueprintPure, Category = "Nexus|Potions", meta = (DefaultToSelf = "PlayerActor"))
+	static float GetPotionCharges(AActor* PlayerActor, ENexusPotionType PotionType);
+
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Potions", meta = (DefaultToSelf = "PlayerActor"))
+	static bool SetPotionCharges(AActor* PlayerActor, ENexusPotionType PotionType, float NewCharges);
+
+	/** W_PotionSlot's count binding: the SELECTED type's flask count. */
+	UFUNCTION(BlueprintPure, Category = "Nexus|Potions", meta = (DefaultToSelf = "PlayerActor"))
+	static int32 GetSelectedPotionCount(AActor* PlayerActor);
+
+	/** W_PotionSlot's bar binding: the SELECTED type's charge as a 0..1 fill. */
+	UFUNCTION(BlueprintPure, Category = "Nexus|Potions", meta = (DefaultToSelf = "PlayerActor"))
+	static float GetSelectedPotionChargePercent(AActor* PlayerActor);
+
+	/**
+	 * The restore effect for a potion type, read from BP_NexusPlayer's "HealthPotionEffect" /
+	 * "ManaPotionEffect" variables. Both are infinite periodic GEs driven by the Data.Heal
+	 * SetByCaller magnitude; they differ only in the attribute they modify.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Nexus|Potions", meta = (DefaultToSelf = "PlayerActor"))
+	static TSubclassOf<UGameplayEffect> GetPotionEffectClass(AActor* PlayerActor, ENexusPotionType PotionType);
+
+	/** Restore per tick for a potion type ("HealAmountPerSip" / "ManaAmountPerSip"). */
+	UFUNCTION(BlueprintPure, Category = "Nexus|Potions", meta = (DefaultToSelf = "PlayerActor"))
+	static float GetPotionSipAmount(AActor* PlayerActor, ENexusPotionType PotionType);
+
+	/**
+	 * F held down: applies the type's restore GE and starts the 1s drain tick. Fails (and
+	 * applies nothing) when the player holds no flask of that type. Drinking a second type
+	 * while one is already going stops the first, so only one GE is ever active.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Potions", meta = (DefaultToSelf = "PlayerActor"))
+	static bool StartPotion(AActor* PlayerActor, ENexusPotionType PotionType);
+
+	/** F released / drink finished: removes the restore GE and stops the drain tick. */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Potions", meta = (DefaultToSelf = "PlayerActor"))
+	static void StopPotion(AActor* PlayerActor);
+
+	// --- Loot ------------------------------------------------------------------------
 
 	/**
 	 * Full pickup flow for BP_LootPickup's ActorBeginOverlap: ignores non-player actors,
-	 * reads the pickup's bIsGold/GoldAmount/PickupSound variables, grants gold (saved
-	 * immediately) or a potion, plays the sound, and destroys the pickup.
+	 * reads the pickup's LootType/GoldAmount/PickupSound variables, grants gold (saved
+	 * immediately) or the matching potion item, plays the sound, and destroys the pickup.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Nexus|Loot", meta = (DefaultToSelf = "Pickup"))
 	static void HandleLootPickup(AActor* Pickup, AActor* OtherActor);
 
 	/**
-	 * Enemy-death loot roll: DropChance to drop anything, then GoldShare of drops are
-	 * gold, the rest potions. Deferred-spawns BP_LootPickup 50 units above DeadEnemy
-	 * (bIsGold set before spawn finishes) and restyles the mesh for potion drops.
-	 * Returns the spawned pickup or null when the roll fails.
+	 * Enemy-death loot roll, in two stages: DropChance decides whether anything drops at all,
+	 * then GoldShare of drops are gold and the rest are potions -- and a potion drop splits
+	 * again, ManaPotionShare of the time, into mana rather than health. Deferred-spawns
+	 * BP_LootPickup 50 units above DeadEnemy (LootType set before spawn finishes) and restyles
+	 * it to match. Returns the spawned pickup or null when the first roll fails.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Nexus|Loot", meta = (DefaultToSelf = "DeadEnemy"))
 	static AActor* SpawnLootDrop(AActor* DeadEnemy, float DropChance = 0.7f, float GoldShare = 0.6f);
+
+	/**
+	 * Puts a dropped item on the ground in front of the player, for the inventory's drop actions.
+	 *
+	 * Spawns BP_DroppedItemPickup -- ours, not the plugin's BP_BasicItemPickup. Dropped items are
+	 * E-interact pickups (same grammar as chests), never walk-over: the plugin's pickup grants
+	 * itself on overlap from *Blueprint*, which C++ cannot suppress, so it needed a collision-off
+	 * arm timer to stop it self-collecting on the frame it spawned. Ours simply has no overlap
+	 * grant, so that whole hack is gone. Enemy loot (BP_LootPickup) stays walk-over.
+	 *
+	 * Sets the item class and quantity before FinishSpawningActor so BeginPlay sees them, then
+	 * resolves the item's soft PickupMesh onto the mesh component and labels the prompt.
+	 *
+	 * It lands DropForwardOffset in front of the player, pulled back from any wall in between and
+	 * dropped onto the floor below.
+	 *
+	 * Only spawns the world actor -- the caller still removes the item from the inventory.
+	 * PlayerActor may be the pawn or its controller. Returns the pickup, or null on failure.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Loot")
+	static AActor* SpawnDroppedItem(AActor* PlayerActor, TSubclassOf<class UNarrativeItem> ItemClass,
+		int32 Quantity = 1);
+
+	/**
+	 * Labels a dropped pickup's interact prompt from the item it holds: "[E] Mana Potion", or
+	 * "[E] Mana Potion x3" when it holds a stack.
+	 *
+	 * The prompt widgets are otherwise per-verb with hardcoded text (W_InteractPrompt "[E] Extract",
+	 * W_InteractPrompt_Open "[E] Open"), which is why the chest needed its own widget class. A
+	 * dropped item's label is dynamic, so this reuses W_InteractPrompt's asset and overwrites the
+	 * TextBlock in the widget component's own widget instance -- per-pickup, so it cannot leak
+	 * into the chest's prompt. Called at spawn and again after a partial take.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Loot", meta = (DefaultToSelf = "Pickup"))
+	static bool RefreshDroppedItemPrompt(AActor* Pickup);
+
+	/** BP_DroppedItemPickup's ShowInteractPrompt: shows/hides its prompt widget component. */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Loot", meta = (DefaultToSelf = "Pickup"))
+	static void SetDroppedItemPromptVisible(AActor* Pickup, bool bShow);
+
+	/**
+	 * BP_DroppedItemPickup's Interact: grants the pickup's item to the interacting player's
+	 * RunInventory and destroys it.
+	 *
+	 * A full inventory is handled rather than swallowed: TryAddItemFromClass reports how much it
+	 * actually took, so a partial add decrements the pickup's remaining quantity, relabels the
+	 * prompt and leaves it standing. The item is never destroyed without being granted.
+	 * Returns true when anything at all was granted.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Loot", meta = (DefaultToSelf = "Pickup"))
+	static bool TakeDroppedItem(AActor* Pickup, AActor* InteractingActor);
+
+	/**
+	 * An item's own class, typed. Blueprint cannot produce this: GetObjectClass returns a plain
+	 * "Object Class Reference", which the schema refuses to narrow to a "Narrative Item Class
+	 * Reference", and the only legal bridge (Cast To Class) is a node type our tooling cannot
+	 * create. So the drop graphs get their ItemClass from here instead.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Nexus|Loot")
+	static TSubclassOf<class UNarrativeItem> GetNarrativeItemClass(class UNarrativeItem* Item);
+
+	/**
+	 * An item's use sound. Same reason as GetNarrativeItemClass: reading UNarrativeItem::UseSound
+	 * needs a Get node bound to a property on another class, which our tooling cannot create (it
+	 * only makes self-member getters). The use sound moved to the Use button, so the widgets need it.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Nexus|Inventory")
+	static class USoundBase* GetItemUseSound(class UNarrativeItem* Item);
 
 	/**
 	 * The named NarrativeInventoryComponent ("RunInventory" or "Stash") on the player state
@@ -223,9 +387,10 @@ public:
 
 	/**
 	 * Chests/containers: fills Container's own NarrativeInventoryComponent with a random amount
-	 * of gold (MinGold..MaxGold of BP_Item_Gold) and potions (MinPotions..MaxPotions of
-	 * BP_Item_HealthPotion). Call once (e.g. chest BeginPlay). No-op without authority or an
-	 * inventory component. Returns true when at least one item stack was added.
+	 * of gold (MinGold..MaxGold of BP_Item_Gold) and potions (MinPotions..MaxPotions). Each
+	 * potion rolls its type independently, on the same ManaPotionShare split the enemy drops
+	 * use, so a chest can hold a mix of both. Call once (e.g. chest BeginPlay). No-op without
+	 * authority or an inventory component. Returns true when at least one item stack was added.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Nexus|Loot", meta = (DefaultToSelf = "Container"))
 	static bool PopulateContainerLoot(AActor* Container, int32 MinGold = 30, int32 MaxGold = 80,
