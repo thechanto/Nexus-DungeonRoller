@@ -10,6 +10,8 @@
 class UButton;
 class UComboBoxString;
 class USlider;
+class UTextBlock;
+class USoundBase;
 
 /**
  * Native parent for W_SettingsMenu.
@@ -25,6 +27,8 @@ class NEXUS_API UNexusSettingsMenu : public UUserWidget
 	GENERATED_BODY()
 
 public:
+	UNexusSettingsMenu(const FObjectInitializer& ObjectInitializer);
+
 	/** Removes the menu, leaving whatever opened it (the pause menu) on screen underneath. */
 	UFUNCTION(BlueprintCallable, Category = "Nexus|Settings")
 	void CloseSettingsMenu();
@@ -36,6 +40,10 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<USlider> Slider_MasterVolume;
 
+	/** The existing sensitivity slider, now driven from C++ (its old Blueprint chains are removed). */
+	UPROPERTY(meta = (BindWidget))
+	TObjectPtr<USlider> SensitivitySlider;
+
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UComboBoxString> Combo_Resolution;
 
@@ -45,9 +53,32 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UButton> Button_Back;
 
+	/** Optional percent readout beside the volume slider, added in the widget pass. Bound if present. */
+	UPROPERTY(meta = (BindWidgetOptional))
+	TObjectPtr<UTextBlock> Text_VolumeValue;
+
+	/**
+	 * Played once when the volume slider is released (OnMouseCaptureEnd), so the player hears the level
+	 * they just set even in a silent context (paused game / main menu, SFX-only project). Because the
+	 * cue plays through the same audio device the master volume scales, it audibly reflects the setting.
+	 * Defaulted to a short existing cue in the constructor; swappable in the widget's defaults.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Nexus|Settings")
+	TObjectPtr<USoundBase> VolumeFeedbackCue;
+
 private:
 	UFUNCTION()
 	void HandleMasterVolumeChanged(float Value);
+
+	UFUNCTION()
+	void HandleSensitivityChanged(float Value);
+
+	/** Plays VolumeFeedbackCue on slider release so the level is testable by ear in any context. */
+	UFUNCTION()
+	void HandleVolumeCommitted();
+
+	/** Sets Text_VolumeValue to a whole-percent string if the label is bound. */
+	void UpdateVolumeReadout(float Value);
 
 	UFUNCTION()
 	void HandleResolutionChanged(FString SelectedItem, ESelectInfo::Type SelectionType);

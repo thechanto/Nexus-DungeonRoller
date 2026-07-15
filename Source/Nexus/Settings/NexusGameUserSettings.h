@@ -39,6 +39,26 @@ public:
 	float GetMasterVolume() const { return MasterVolume; }
 
 	/**
+	 * Mouse look sensitivity, persisted to GameUserSettings.ini alongside master volume.
+	 *
+	 * This used to live only as an in-memory variable on BP_MyGameInstance, so it never survived a
+	 * relaunch (it merely persisted across level loads within one session). It now has a real home.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Settings")
+	void SetMouseSensitivity(float InMouseSensitivity);
+
+	UFUNCTION(BlueprintPure, Category = "Nexus|Settings")
+	float GetMouseSensitivity() const { return MouseSensitivity; }
+
+	/**
+	 * Static convenience for the gameplay look/turn path (BP_NexusPlayer scales yaw + pitch by this).
+	 * Resolves the settings singleton and returns 1.0 if it is somehow unavailable, so the input path
+	 * degrades to unscaled rather than to zero (an unreadable, look-is-dead value).
+	 */
+	UFUNCTION(BlueprintPure, Category = "Nexus|Settings")
+	static float GetNexusMouseSensitivity();
+
+	/**
 	 * Pushes MasterVolume into the audio device as its transient primary volume.
 	 *
 	 * The engine does not persist that value, so it has to be re-pushed on every launch --
@@ -57,4 +77,8 @@ protected:
 	/** Written to [/Script/Nexus.NexusGameUserSettings] in GameUserSettings.ini. */
 	UPROPERTY(config)
 	float MasterVolume;
+
+	/** Written to the same section. Read live by the gameplay look path via GetNexusMouseSensitivity. */
+	UPROPERTY(config)
+	float MouseSensitivity;
 };

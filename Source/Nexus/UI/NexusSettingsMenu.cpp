@@ -5,8 +5,13 @@
 #include "Components/Button.h"
 #include "Components/ComboBoxString.h"
 #include "Components/Slider.h"
+#include "Components/TextBlock.h"
+#include "GenericPlatform/GenericApplication.h" // FDisplayMetrics, for the fullscreen resolution snap
+#include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "Nexus/Settings/NexusGameUserSettings.h"
+#include "Sound/SoundBase.h"
+#include "UObject/ConstructorHelpers.h"
 
 namespace NexusSettingsMenu
 {
@@ -35,6 +40,18 @@ namespace NexusSettingsMenu
 	}
 }
 
+UNexusSettingsMenu::UNexusSettingsMenu(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+	// A short existing cue for the volume-release feedback. EditAnywhere, so it can be swapped in the
+	// widget's defaults; this just spares a manual wire-up and keeps the cue referenced for cooking.
+	static ConstructorHelpers::FObjectFinder<USoundBase> CueFinder(TEXT("/Game/Audio/swoosh_low.swoosh_low"));
+	if (CueFinder.Succeeded())
+	{
+		VolumeFeedbackCue = CueFinder.Object;
+	}
+}
+
 void UNexusSettingsMenu::NativeConstruct()
 {
 	Super::NativeConstruct();
@@ -50,6 +67,14 @@ void UNexusSettingsMenu::NativeConstruct()
 		Slider_MasterVolume->SetMaxValue(1.0f);
 		Slider_MasterVolume->SetValue(Settings ? Settings->GetMasterVolume() : 1.0f);
 	}
+	UpdateVolumeReadout(Settings ? Settings->GetMasterVolume() : 1.0f);
+
+	// Sensitivity: seed value only. Its min/max were set in the designer and "worked before"; leaving
+	// them untouched preserves the existing feel rather than silently re-ranging the slider.
+	if (SensitivitySlider)
+	{
+		SensitivitySlider->SetValue(Settings ? Settings->GetMouseSensitivity() : 1.0f);
+	}
 
 	PopulateResolutions();
 	PopulateWindowModes();
@@ -57,6 +82,13 @@ void UNexusSettingsMenu::NativeConstruct()
 	if (Slider_MasterVolume)
 	{
 		Slider_MasterVolume->OnValueChanged.AddDynamic(this, &UNexusSettingsMenu::HandleMasterVolumeChanged);
+		// Commit-time feedback, not per-tick: play the cue once when the handle is released.
+		Slider_MasterVolume->OnMouseCaptureEnd.AddDynamic(this, &UNexusSettingsMenu::HandleVolumeCommitted);
+	}
+
+	if (SensitivitySlider)
+	{
+		SensitivitySlider->OnValueChanged.AddDynamic(this, &UNexusSettingsMenu::HandleSensitivityChanged);
 	}
 
 	if (Combo_Resolution)
@@ -171,6 +203,35 @@ void UNexusSettingsMenu::HandleMasterVolumeChanged(float Value)
 		// in NativeDestruct.
 		Settings->SetMasterVolume(Value);
 	}
+
+	UpdateVolumeReadout(Value);
+}
+
+void UNexusSettingsMenu::HandleSensitivityChanged(float Value)
+{
+	if (UNexusGameUserSettings* Settings = UNexusGameUserSettings::GetNexusGameUserSettings())
+	{
+		// Read live by the gameplay look path via GetNexusMouseSensitivity; written to disk in
+		// NativeDestruct alongside master volume.
+		Settings->SetMouseSensitivity(Value);
+	}
+}
+
+void UNexusSettingsMenu::HandleVolumeCommitted()
+{
+	if (VolumeFeedbackCue)
+	{
+		UGameplayStatics::PlaySound2D(this, VolumeFeedbackCue);
+	}
+}
+
+void UNexusSettingsMenu::UpdateVolumeReadout(float Value)
+{
+	if (Text_VolumeValue)
+	{
+		const int32 Percent = FMath::RoundToInt(FMath::Clamp(Value, 0.0f, 1.0f) * 100.0f);
+		Text_VolumeValue->SetText(FText::FromString(FString::Printf(TEXT("%d%%"), Percent)));
+	}
 }
 
 void UNexusSettingsMenu::HandleResolutionChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
@@ -235,7 +296,44 @@ void UNexusSettingsMenu::HandleWindowModeChanged(FString SelectedItem, ESelectIn
 		return;
 	}
 
+	// Exclusive fullscreen cannot be driven from a PIE window -- attempting it shrinks the window and
+	// then hangs on the OS maximize. In-editor, degrade it to borderless (WindowedFullscreen), which
+	// looks identical and is safe. A packaged build (GIsEditor false) still gets true exclusive.
+	if (GIsEditor && Mode == EWindowMode::Fullscreen)
+	{
+		UE_LOG(LogNexusSettings, Log,
+			TEXT("HandleWindowModeChanged: in-editor, degrading exclusive Fullscreen to Borderless."));
+		Mode = EWindowMode::WindowedFullscreen;
+	}
+
 	Settings->SetFullscreenMode(Mode);
+
+	// Snap resolution to the desktop's native size when entering a fullscreen mode, and apply mode +
+	// resolution together via a single ApplySettings. Without this, going fullscreen inherits a leftover
+	// windowed size and produces a tiny fullscreen at the wrong resolution.
+	if (Mode == EWindowMode::Fullscreen || Mode == EWindowMode::WindowedFullscreen)
+	{
+		FDisplayMetrics DisplayMetrics;
+		FDisplayMetrics::RebuildDisplayMetrics(DisplayMetrics);
+		const FIntPoint Desktop(DisplayMetrics.PrimaryDisplayWidth, DisplayMetrics.PrimaryDisplayHeight);
+		if (Desktop.X > 0 && Desktop.Y > 0)
+		{
+			Settings->SetScreenResolution(Desktop);
+
+			// Keep the resolution combo showing what we actually applied. SetSelectedOption fires
+			// OnSelectionChanged with ESelectInfo::Direct, which HandleResolutionChanged ignores.
+			if (Combo_Resolution)
+			{
+				const FString DesktopOption = NexusSettingsMenu::ResolutionToString(Desktop);
+				if (Combo_Resolution->FindOptionIndex(DesktopOption) == INDEX_NONE)
+				{
+					Combo_Resolution->AddOption(DesktopOption);
+				}
+				Combo_Resolution->SetSelectedOption(DesktopOption);
+			}
+		}
+	}
+
 	Settings->ApplySettings(false);
 	Settings->ConfirmVideoMode();
 
