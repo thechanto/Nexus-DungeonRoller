@@ -33,6 +33,15 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Nexus|Settings")
 	void CloseSettingsMenu();
 
+	/**
+	 * If a settings menu is currently on screen, close only it and return true; otherwise return false.
+	 * Called from the controller's TogglePauseMenu so Esc inside Settings closes just Settings (back to
+	 * the still-paused pause menu) instead of routing to the resume path and orphaning the panel over
+	 * live gameplay. O(1) via the ActiveInstance registry rather than a viewport widget scan.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Settings")
+	static bool CloseOpenSettingsMenu();
+
 protected:
 	virtual void NativeConstruct() override;
 	virtual void NativeDestruct() override;
@@ -94,4 +103,12 @@ private:
 
 	/** Fills Combo_WindowMode with the three window modes and selects the current one. */
 	void PopulateWindowModes();
+
+	/**
+	 * The settings menu currently on screen, if any. Set in NativeConstruct, cleared in NativeDestruct.
+	 * Weak so a menu torn down by any path (Back button, RemoveFromParent, GC) never leaves a dangling
+	 * pointer that CloseOpenSettingsMenu could act on. Single-instance by construction -- the pause menu
+	 * only ever spawns one at a time.
+	 */
+	static TWeakObjectPtr<UNexusSettingsMenu> ActiveInstance;
 };

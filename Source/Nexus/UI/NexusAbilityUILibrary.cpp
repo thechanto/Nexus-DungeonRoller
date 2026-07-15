@@ -2984,7 +2984,8 @@ namespace
 
 		if (UStaticMeshComponent* MeshComp = Pickup->FindComponentByClass<UStaticMeshComponent>())
 		{
-			// SetStaticMesh clears material overrides, so the mesh has to land before the material.
+			// SetStaticMesh initializes the component's material slots from the new mesh, so the mesh
+			// has to land before SetMaterial or the override has no slot to bind to.
 			if (UStaticMesh* Mesh = ReadObjectField<UStaticMesh>(PickupClass, Pickup, MeshField))
 			{
 				MeshComp->SetStaticMesh(Mesh);

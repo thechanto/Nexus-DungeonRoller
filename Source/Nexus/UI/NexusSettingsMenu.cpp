@@ -40,6 +40,8 @@ namespace NexusSettingsMenu
 	}
 }
 
+TWeakObjectPtr<UNexusSettingsMenu> UNexusSettingsMenu::ActiveInstance;
+
 UNexusSettingsMenu::UNexusSettingsMenu(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
@@ -55,6 +57,10 @@ UNexusSettingsMenu::UNexusSettingsMenu(const FObjectInitializer& ObjectInitializ
 void UNexusSettingsMenu::NativeConstruct()
 {
 	Super::NativeConstruct();
+
+	// Register as the on-screen settings menu so the pause toggle can find and close it (see
+	// CloseOpenSettingsMenu). Only one exists at a time; last constructed wins.
+	ActiveInstance = this;
 
 	const UNexusGameUserSettings* Settings = UNexusGameUserSettings::GetNexusGameUserSettings();
 
@@ -115,6 +121,13 @@ void UNexusSettingsMenu::NativeDestruct()
 	if (UNexusGameUserSettings* Settings = UNexusGameUserSettings::GetNexusGameUserSettings())
 	{
 		Settings->SaveSettings();
+	}
+
+	// Clear the registry only if we are still the active one -- guards against a newer menu having
+	// already claimed it before this one tears down.
+	if (ActiveInstance == this)
+	{
+		ActiveInstance.Reset();
 	}
 
 	Super::NativeDestruct();
@@ -348,4 +361,17 @@ void UNexusSettingsMenu::HandleBackClicked()
 void UNexusSettingsMenu::CloseSettingsMenu()
 {
 	RemoveFromParent();
+}
+
+bool UNexusSettingsMenu::CloseOpenSettingsMenu()
+{
+	if (UNexusSettingsMenu* Menu = ActiveInstance.Get())
+	{
+		// Same teardown the Back button uses: removes only the settings menu and leaves the paused
+		// pause menu on screen underneath. NativeDestruct clears ActiveInstance.
+		Menu->CloseSettingsMenu();
+		return true;
+	}
+
+	return false;
 }
