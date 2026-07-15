@@ -2856,6 +2856,17 @@ namespace
 	/** Of the drops that are not gold, how many are mana rather than health. */
 	constexpr float GManaPotionShare = 0.5f;
 
+	/**
+	 * How many enemy drops are a weapon rather than gold-or-potion. Rolled first and separately so
+	 * the tuned gold/potion split below stays untouched -- folding weapons into a flat three-way
+	 * would silently cut the gold rate. Enemy-only: the chest path (PopulateContainerLoot) never
+	 * calls this, so chests stay gold/potion.
+	 */
+	constexpr float GWeaponShare = 0.08f;
+
+	/** Of the drops that are weapons, an even split between the two curated items. */
+	constexpr float GWeaponAxeShare = 0.5f;
+
 	/** Everything that differs between one drop type and the next, indexed by ENexusLootType. */
 	struct FLootFields
 	{
@@ -2878,9 +2889,12 @@ namespace
 		// ManaPotion
 		{ TEXT("ManaPotionMesh"), TEXT("ManaPotionMaterial"), TEXT("ManaPotionScale"), TEXT("ManaPotionLightColor"),
 		  TEXT("/Game/Inventory/Items/BP_Item_ManaPotion.BP_Item_ManaPotion_C"), TEXT("mana potion") },
-		// Weapon -- reserved. Styled off the potion fields until it has its own; never rolled.
-		{ TEXT("PotionMesh"), TEXT("PotionMaterial"), TEXT("PotionScale"), TEXT("PotionLightColor"),
-		  nullptr, TEXT("weapon") },
+		// WeaponRustedAxe
+		{ TEXT("WeaponAxeMesh"), TEXT("WeaponAxeMaterial"), TEXT("WeaponAxeScale"), TEXT("WeaponAxeLightColor"),
+		  TEXT("/Game/Inventory/Items/BP_Item_Weapon_RustedAxe.BP_Item_Weapon_RustedAxe_C"), TEXT("rusted axe") },
+		// WeaponApprenticeStaff
+		{ TEXT("WeaponStaffMesh"), TEXT("WeaponStaffMaterial"), TEXT("WeaponStaffScale"), TEXT("WeaponStaffLightColor"),
+		  TEXT("/Game/Inventory/Items/BP_Item_Weapon_ApprenticeStaff.BP_Item_Weapon_ApprenticeStaff_C"), TEXT("apprentice's staff") },
 	};
 
 	constexpr int32 GLootTypeCount = static_cast<int32>(UE_ARRAY_COUNT(GLootFields));
@@ -2895,6 +2909,22 @@ namespace
 	ENexusLootType RollPotionLootType()
 	{
 		return (FMath::FRand() < GManaPotionShare) ? ENexusLootType::ManaPotion : ENexusLootType::HealthPotion;
+	}
+
+	/** Which weapon a drop that has already been decided to be a weapon turns out to be. */
+	ENexusLootType RollWeaponLootType()
+	{
+		return (FMath::FRand() < GWeaponAxeShare) ? ENexusLootType::WeaponRustedAxe : ENexusLootType::WeaponApprenticeStaff;
+	}
+
+	/**
+	 * Whether a rolled type is a curated weapon. Weapons spawn as E-interact BP_DroppedItemPickup
+	 * (announced name, grant on E), not walk-over BP_LootPickup tokens -- so both the enemy drop and
+	 * the boss ring branch on this to pick the pickup actor.
+	 */
+	bool IsWeaponLootType(ENexusLootType Type)
+	{
+		return Type == ENexusLootType::WeaponRustedAxe || Type == ENexusLootType::WeaponApprenticeStaff;
 	}
 
 	/**
@@ -3067,12 +3097,35 @@ AActor* UNexusAbilityUILibrary::SpawnLootDrop(AActor* DeadEnemy, float DropChanc
 		return nullptr;
 	}
 
-	// Two stages: gold or a potion, and then which potion. Rolling the type separately keeps the
-	// gold/potion balance exactly where it was when mana potions were added -- a flat three-way
-	// roll would have quietly cut the gold rate.
-	const ENexusLootType LootType = (FMath::FRand() < GoldShare)
-		? ENexusLootType::Gold
-		: RollPotionLootType();
+	// A rare weapon pre-roll, then the existing two-stage gold/potion split. Weapons are decided
+	// first and separately so the tuned GoldShare balance is untouched -- a flat split would have
+	// quietly cut every other rate. If it isn't a weapon: gold or a potion, then which potion.
+	const ENexusLootType LootType = (FMath::FRand() < GWeaponShare)
+		? RollWeaponLootType()
+		: (FMath::FRand() < GoldShare)
+			? ENexusLootType::Gold
+			: RollPotionLootType();
+
+	// Weapons are E-interact dropped items (BP_DroppedItemPickup), not walk-over tokens: they get an
+	// announced name prompt and grant on E, the same grammar as an inventory-dropped weapon. The item
+	// class comes from the same GLootFields row the token styling used, so the roll is untouched. Gold
+	// and potions fall through to the walk-over BP_LootPickup path below.
+	if (IsWeaponLootType(LootType))
+	{
+		UClass* ItemClass = LoadClass<UNarrativeItem>(nullptr, LootFields(LootType).ItemPath);
+		if (!ItemClass)
+		{
+			UE_LOG(LogNexusAbilityUI, Warning, TEXT("SpawnLootDrop: weapon item class failed to load (%s)"),
+				LootFields(LootType).ItemPath);
+			return nullptr;
+		}
+		const FTransform WeaponTransform(FRotator::ZeroRotator,
+			DeadEnemy->GetActorLocation() + FVector(0.0f, 0.0f, 50.0f));
+		AActor* WeaponDrop = SpawnDroppedItemAt(World, ItemClass, 1, WeaponTransform);
+		UE_LOG(LogNexusAbilityUI, Log, TEXT("SpawnLootDrop: dropped %s (E-interact) from %s"),
+			LootFields(LootType).DisplayName, *DeadEnemy->GetName());
+		return WeaponDrop;
+	}
 
 	const FTransform SpawnTransform(DeadEnemy->GetActorLocation() + FVector(0.0f, 0.0f, 50.0f));
 	AActor* Pickup = World->SpawnActorDeferred<AActor>(PickupClass, SpawnTransform, nullptr, nullptr,
@@ -3137,6 +3190,38 @@ namespace
 
 	/** Ours, not the plugin's BP_BasicItemPickup: E-interact, no overlap grant. */
 	const TCHAR* DroppedItemPickupPath = TEXT("/Game/Loot/BP_DroppedItemPickup.BP_DroppedItemPickup_C");
+
+	// Weapons render far larger on the ground than the old loot tokens (axe 0.9 / staff 0.375) so they
+	// read as real weapons lying there. Re-derived from the native mesh sizes: the axe sits near its
+	// native 82cm; the 2.3m staff mesh is cut hard so it lands ~1.4m. Tunable in the inspector? No --
+	// this is C++ so the same value applies to every drop path at once.
+	constexpr float GWeaponAxeDropScale   = 1.10f;
+	constexpr float GWeaponStaffDropScale = 0.60f;
+
+	/**
+	 * Ground scale for a dropped item's mesh, keyed on the item class -- not the spawn site -- so a
+	 * weapon looks identical however it reaches the ground: an enemy drop, a boss ring slot, or a bag
+	 * drop (which is what fixes the previously oversized bag-dropped staff for free). Everything else
+	 * drops at native 1.0. LoadClass on an already-loaded class is a fast lookup, and drops are rare.
+	 */
+	float DropScaleForItem(const UClass* ItemClass)
+	{
+		if (!ItemClass)
+		{
+			return 1.0f;
+		}
+		if (ItemClass == LoadClass<UNarrativeItem>(nullptr,
+			TEXT("/Game/Inventory/Items/BP_Item_Weapon_RustedAxe.BP_Item_Weapon_RustedAxe_C")))
+		{
+			return GWeaponAxeDropScale;
+		}
+		if (ItemClass == LoadClass<UNarrativeItem>(nullptr,
+			TEXT("/Game/Inventory/Items/BP_Item_Weapon_ApprenticeStaff.BP_Item_Weapon_ApprenticeStaff_C")))
+		{
+			return GWeaponStaffDropScale;
+		}
+		return 1.0f;
+	}
 
 	/**
 	 * The item class a dropped pickup is holding. Tries both spellings: our BP_DroppedItemPickup
@@ -3300,6 +3385,68 @@ USoundBase* UNexusAbilityUILibrary::GetItemUseSound(UNarrativeItem* Item)
 	return Item ? Item->UseSound : nullptr;
 }
 
+AActor* UNexusAbilityUILibrary::SpawnDroppedItemAt(UWorld* World, TSubclassOf<UNarrativeItem> ItemClass,
+	int32 Quantity, const FTransform& SpawnTransform)
+{
+	if (!World || !ItemClass || Quantity <= 0)
+	{
+		return nullptr;
+	}
+
+	UClass* PickupClass = LoadClass<AActor>(nullptr, DroppedItemPickupPath);
+	if (!PickupClass)
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("SpawnDroppedItemAt: BP_DroppedItemPickup failed to load (%s)"),
+			DroppedItemPickupPath);
+		return nullptr;
+	}
+
+	AActor* Pickup = World->SpawnActorDeferred<AActor>(PickupClass, SpawnTransform, nullptr, nullptr,
+		ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+	if (!Pickup)
+	{
+		return nullptr;
+	}
+
+	// Set before FinishSpawningActor so the pickup's BeginPlay already knows what it is holding.
+	// Neither variable is exposed-on-spawn, but raw reflection does not care about that flag.
+	if (!WriteClassField(Pickup->GetClass(), Pickup, TEXT("ItemClass"), ItemClass) &&
+		!WriteClassField(Pickup->GetClass(), Pickup, TEXT("Item Class"), ItemClass))
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("SpawnDroppedItemAt: %s has no ItemClass variable"),
+			*PickupClass->GetName());
+	}
+	WriteNumericField(Pickup->GetClass(), Pickup, TEXT("QuantityToGive"), Quantity);
+
+	UGameplayStatics::FinishSpawningActor(Pickup, SpawnTransform);
+	if (!IsValid(Pickup))
+	{
+		return nullptr;
+	}
+
+	// The pickup's SCS components do not exist until FinishSpawningActor has run, so the mesh and the
+	// prompt are set here rather than above. BP_LootPickup resolves its own look from LootType; a
+	// dropped item can be any item, so its look comes from the item's own soft PickupMesh, sized by
+	// DropScaleForItem so a weapon reads as a real weapon on the ground instead of a loot token.
+	if (UStaticMeshComponent* MeshComponent = Pickup->FindComponentByClass<UStaticMeshComponent>())
+	{
+		if (UStaticMesh* Mesh = ItemClass->GetDefaultObject<UNarrativeItem>()->PickupMesh.LoadSynchronous())
+		{
+			MeshComponent->SetStaticMesh(Mesh);
+			MeshComponent->SetRelativeScale3D(FVector(DropScaleForItem(ItemClass)));
+		}
+		else
+		{
+			UE_LOG(LogNexusAbilityUI, Warning, TEXT("SpawnDroppedItemAt: %s has no PickupMesh, drop is invisible"),
+				*ItemClass->GetName());
+		}
+	}
+
+	RefreshDroppedItemPrompt(Pickup);
+	SetDroppedItemPromptVisible(Pickup, false);
+	return Pickup;
+}
+
 AActor* UNexusAbilityUILibrary::SpawnDroppedItem(AActor* PlayerActor, TSubclassOf<UNarrativeItem> ItemClass,
 	int32 Quantity)
 {
@@ -3319,59 +3466,21 @@ AActor* UNexusAbilityUILibrary::SpawnDroppedItem(AActor* PlayerActor, TSubclassO
 	}
 
 	UWorld* World = Dropper->GetWorld();
-	UClass* PickupClass = LoadClass<AActor>(nullptr, DroppedItemPickupPath);
-	if (!World || !PickupClass)
+	if (!World)
 	{
-		UE_LOG(LogNexusAbilityUI, Warning, TEXT("SpawnDroppedItem: BP_DroppedItemPickup failed to load (%s)"),
-			DroppedItemPickupPath);
 		return nullptr;
 	}
 
+	// This path adds the in-front-of-the-player placement (wall-clearance + floor trace); the shared
+	// core does the spawn, item wiring, mesh/scale and prompt. Only spawns the world actor -- the
+	// caller still removes the item from the inventory.
 	const FTransform SpawnTransform(FRotator::ZeroRotator, FindDropLocation(Dropper, World));
-	AActor* Pickup = World->SpawnActorDeferred<AActor>(PickupClass, SpawnTransform, nullptr, nullptr,
-		ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
-	if (!Pickup)
+	AActor* Pickup = SpawnDroppedItemAt(World, ItemClass, Quantity, SpawnTransform);
+	if (Pickup)
 	{
-		return nullptr;
+		UE_LOG(LogNexusAbilityUI, Log, TEXT("SpawnDroppedItem: %s dropped %d x %s"),
+			*Dropper->GetName(), Quantity, *ItemClass->GetName());
 	}
-
-	// Set before FinishSpawningActor so the pickup's BeginPlay already knows what it is holding.
-	// Neither variable is exposed-on-spawn, but raw reflection does not care about that flag.
-	if (!WriteClassField(Pickup->GetClass(), Pickup, TEXT("ItemClass"), ItemClass) &&
-		!WriteClassField(Pickup->GetClass(), Pickup, TEXT("Item Class"), ItemClass))
-	{
-		UE_LOG(LogNexusAbilityUI, Warning, TEXT("SpawnDroppedItem: %s has no ItemClass variable"),
-			*PickupClass->GetName());
-	}
-	WriteNumericField(Pickup->GetClass(), Pickup, TEXT("QuantityToGive"), Quantity);
-
-	UGameplayStatics::FinishSpawningActor(Pickup, SpawnTransform);
-	if (!IsValid(Pickup))
-	{
-		return nullptr;
-	}
-
-	// The pickup's SCS components do not exist until FinishSpawningActor has run, so the mesh and
-	// the prompt are set here rather than above. BP_LootPickup resolves its own look from LootType;
-	// a dropped item can be any item, so its look comes from the item's own soft PickupMesh.
-	if (UStaticMeshComponent* MeshComponent = Pickup->FindComponentByClass<UStaticMeshComponent>())
-	{
-		if (UStaticMesh* Mesh = ItemClass->GetDefaultObject<UNarrativeItem>()->PickupMesh.LoadSynchronous())
-		{
-			MeshComponent->SetStaticMesh(Mesh);
-		}
-		else
-		{
-			UE_LOG(LogNexusAbilityUI, Warning, TEXT("SpawnDroppedItem: %s has no PickupMesh, drop is invisible"),
-				*ItemClass->GetName());
-		}
-	}
-
-	RefreshDroppedItemPrompt(Pickup);
-	SetDroppedItemPromptVisible(Pickup, false);
-
-	UE_LOG(LogNexusAbilityUI, Log, TEXT("SpawnDroppedItem: %s dropped %d x %s"),
-		*Dropper->GetName(), Quantity, *ItemClass->GetName());
 	return Pickup;
 }
 

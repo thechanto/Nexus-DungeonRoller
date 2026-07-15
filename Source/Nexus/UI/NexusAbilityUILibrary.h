@@ -37,8 +37,13 @@ enum class ENexusLootType : uint8
 	Gold         = 0,
 	HealthPotion = 1,
 	ManaPotion   = 2,
-	/** Reserved: weapon drops are next in the queue. Never rolled by SpawnLootDrop yet. */
-	Weapon       = 3
+	/**
+	 * Weapon drops: rare, enemy-only. Two curated items, each a full GLootFields row so style and
+	 * grant flow through the existing table with no special-casing -- SpawnLootDrop just sub-rolls
+	 * 50/50 between them. Index 3 repurposes the old reserved Weapon stub (never persisted on disk).
+	 */
+	WeaponRustedAxe       = 3,
+	WeaponApprenticeStaff = 4
 };
 
 /**
@@ -533,6 +538,18 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Nexus|Abilities", meta = (DefaultToSelf = "Ability"))
 	static void RestoreFromCinematic(UGameplayAbility* Ability);
+
+private:
+	/**
+	 * The shared core behind SpawnDroppedItem and the weapon loot/boss drops: spawns a
+	 * BP_DroppedItemPickup holding ItemClass x Quantity at an explicit transform, sizes its mesh by
+	 * the item (weapons up-scaled from the loot-token sizes via DropScaleForItem), and labels the
+	 * prompt hidden. The public SpawnDroppedItem adds the in-front-of-the-player placement; the loot
+	 * paths pass a corpse or ring point. Only spawns the world actor -- the caller owns any inventory
+	 * removal. Returns the pickup, or null on failure.
+	 */
+	static AActor* SpawnDroppedItemAt(class UWorld* World, TSubclassOf<class UNarrativeItem> ItemClass,
+		int32 Quantity, const FTransform& SpawnTransform);
 };
 
 /**
