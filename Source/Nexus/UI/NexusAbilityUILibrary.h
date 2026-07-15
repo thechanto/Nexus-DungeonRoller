@@ -316,6 +316,17 @@ public:
 	static AActor* SpawnLootDrop(AActor* DeadEnemy, float DropChance = 0.7f, float GoldShare = 0.6f);
 
 	/**
+	 * Boss death shower: a fixed, guaranteed celebration payout of one of *every* loot type -- gold,
+	 * both potions, and both weapons -- scattered on a ring around the corpse. No rolling. Each pickup
+	 * lands on its own spoke (even angles plus a small random ring rotation) and is dropped onto the
+	 * floor by a per-point downward trace, so the five don't stack their trigger spheres or prompts.
+	 * The gold pickup carries BossGold instead of the trash-mob default. Enemy-only, boss-only: this
+	 * runs *alongside* the inherited SpawnLootDrop roll, which stays as a bonus sixth drop.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Loot", meta = (DefaultToSelf = "DeadBoss"))
+	static void SpawnBossLoot(AActor* DeadBoss, float RingRadius = 150.0f, int32 BossGold = 100);
+
+	/**
 	 * Puts a dropped item on the ground in front of the player, for the inventory's drop actions.
 	 *
 	 * Spawns BP_DroppedItemPickup -- ours, not the plugin's BP_BasicItemPickup. Dropped items are

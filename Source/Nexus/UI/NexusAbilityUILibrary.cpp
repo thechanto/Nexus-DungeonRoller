@@ -3151,6 +3151,117 @@ AActor* UNexusAbilityUILibrary::SpawnLootDrop(AActor* DeadEnemy, float DropChanc
 	return Pickup;
 }
 
+void UNexusAbilityUILibrary::SpawnBossLoot(AActor* DeadBoss, float RingRadius, int32 BossGold)
+{
+	if (!DeadBoss || !DeadBoss->HasAuthority())
+	{
+		return;
+	}
+
+	UClass* PickupClass = LoadClass<AActor>(nullptr, TEXT("/Game/Loot/BP_LootPickup.BP_LootPickup_C"));
+	UWorld* World = DeadBoss->GetWorld();
+	if (!PickupClass || !World)
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("SpawnBossLoot: BP_LootPickup class failed to load"));
+		return;
+	}
+
+	// The guaranteed payout: exactly one of every loot type, in table order, no rolling.
+	const ENexusLootType BossLoot[] =
+	{
+		ENexusLootType::Gold,
+		ENexusLootType::HealthPotion,
+		ENexusLootType::ManaPotion,
+		ENexusLootType::WeaponRustedAxe,
+		ENexusLootType::WeaponApprenticeStaff,
+	};
+	constexpr int32 BossLootCount = static_cast<int32>(UE_ARRAY_COUNT(BossLoot));
+
+	const FVector Centre = DeadBoss->GetActorLocation();
+	// Rotate the whole ring by a random offset so repeated boss kills don't stamp an identical pentagon.
+	const float BaseAngleDeg = FMath::FRandRange(0.0f, 360.0f);
+	const float AngleStepDeg = 360.0f / BossLootCount;
+
+	// One trace params for the whole ring; ignore the corpse so a spoke never lands on the boss body.
+	FCollisionQueryParams TraceParams(FName(TEXT("SpawnBossLoot")), /*bTraceComplex*/ false, DeadBoss);
+
+	int32 Spawned = 0;
+	for (int32 i = 0; i < BossLootCount; ++i)
+	{
+		const ENexusLootType LootType = BossLoot[i];
+
+		// Even spokes around the corpse (72 deg apart for five) plus the shared random rotation, so the
+		// pickups spread out instead of stacking their trigger spheres and interaction prompts.
+		const float AngleRad = FMath::DegreesToRadians(BaseAngleDeg + AngleStepDeg * i);
+		FVector Point = Centre + FVector(FMath::Cos(AngleRad), FMath::Sin(AngleRad), 0.0f) * RingRadius;
+
+		// Each spoke gets its own downward trace: the arena floor may be uneven and a ragdolled corpse
+		// can rest above the ground, so a shared height would hang some pickups in the air. Trace from a
+		// little above the ring point down through where a floor should be.
+		const FVector TraceStart = Point + FVector(0.0f, 0.0f, 200.0f);
+		const FVector TraceEnd   = Point - FVector(0.0f, 0.0f, 500.0f);
+		FHitResult FloorHit;
+		if (World->LineTraceSingleByChannel(FloorHit, TraceStart, TraceEnd, ECC_Visibility, TraceParams))
+		{
+			Point = FloorHit.ImpactPoint + FVector(0.0f, 0.0f, 20.0f);
+		}
+		else
+		{
+			// No floor under this spoke -- fall back to the corpse height so it stays near the player.
+			Point.Z = Centre.Z + 50.0f;
+		}
+
+		const FTransform SpawnTransform(FRotator::ZeroRotator, Point);
+
+		// The two weapon slots drop as E-interact BP_DroppedItemPickup at their traced ring point
+		// (announced name, grant on E), matching the enemy weapon drops; gold and potions stay as
+		// walk-over tokens below. The ring placement and floor trace above are shared by both.
+		if (IsWeaponLootType(LootType))
+		{
+			if (UClass* ItemClass = LoadClass<UNarrativeItem>(nullptr, LootFields(LootType).ItemPath))
+			{
+				if (SpawnDroppedItemAt(World, ItemClass, 1, SpawnTransform))
+				{
+					++Spawned;
+				}
+			}
+			else
+			{
+				UE_LOG(LogNexusAbilityUI, Warning, TEXT("SpawnBossLoot: weapon item class failed to load (%s)"),
+					LootFields(LootType).ItemPath);
+			}
+			continue;
+		}
+
+		AActor* Pickup = World->SpawnActorDeferred<AActor>(PickupClass, SpawnTransform, nullptr, nullptr,
+			ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+		if (!Pickup)
+		{
+			continue;
+		}
+
+		WriteLootType(Pickup, LootType);
+
+		// The gold pickup carries a boss-sized lump instead of the trash-mob default of 10.
+		if (LootType == ENexusLootType::Gold)
+		{
+			WriteNumericField(Pickup->GetClass(), Pickup, TEXT("GoldAmount"), static_cast<double>(BossGold));
+		}
+
+		UGameplayStatics::FinishSpawningActor(Pickup, SpawnTransform);
+
+		// Restyle after FinishSpawningActor: the Blueprint's SCS components don't exist before it.
+		if (IsValid(Pickup))
+		{
+			ApplyLootPickupStyle(Pickup, LootType);
+			++Spawned;
+		}
+	}
+
+	UE_LOG(LogNexusAbilityUI, Log, TEXT("SpawnBossLoot: showered %d/%d pickups around %s (ring %.0f, gold %d)"),
+		Spawned, BossLootCount, *DeadBoss->GetName(), RingRadius, BossGold);
+}
+
 namespace
 {
 	/** How far in front of the player a dropped item lands: clear of the capsule, still in reach. */
