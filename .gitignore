@@ -52,3 +52,13 @@ Content/ParagonTerra/
 *.uproject.bak-*
 *.autosave
 *.tmp
+
+# ---- Scratch scripts / bake intermediates / machine-state notes ----
+# Root-level per-session Python probe/automation scripts (editor debris).
+/Scripts/
+# Icon-bake PNG intermediates; the shipped icons are imported .uassets in Content.
+/Art/
+# Temp icon-sampler material from the bake workflow.
+Content/Test/M_TMP_IconSampler.uasset
+# Local GPU driver probation log -- machine-state, not project-state.
+/GPU_PROBATION.md
