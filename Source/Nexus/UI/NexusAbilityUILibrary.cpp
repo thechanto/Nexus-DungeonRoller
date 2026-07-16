@@ -3409,36 +3409,16 @@ namespace
 	/** Ours, not the plugin's BP_BasicItemPickup: E-interact, no overlap grant. */
 	const TCHAR* DroppedItemPickupPath = TEXT("/Game/Loot/BP_DroppedItemPickup.BP_DroppedItemPickup_C");
 
-	// Weapons render far larger on the ground than the old loot tokens (axe 0.9 / staff 0.375) so they
-	// read as real weapons lying there. Re-derived from the native mesh sizes: the axe sits near its
-	// native 82cm; the 2.3m staff mesh is cut hard so it lands ~1.4m. Tunable in the inspector? No --
-	// this is C++ so the same value applies to every drop path at once.
-	constexpr float GWeaponAxeDropScale   = 1.10f;
-	constexpr float GWeaponStaffDropScale = 0.60f;
-
 	/**
 	 * Ground scale for a dropped item's mesh, keyed on the item class -- not the spawn site -- so a
 	 * weapon looks identical however it reaches the ground: an enemy drop, a boss ring slot, or a bag
-	 * drop (which is what fixes the previously oversized bag-dropped staff for free). Everything else
-	 * drops at native 1.0. LoadClass on an already-loaded class is a fast lookup, and drops are rare.
+	 * drop. Reads UNexusWeaponItem::GroundScale off the item's CDO (per-variant data — the old
+	 * hardcoded two-class table is gone); everything else drops at native 1.0.
 	 */
 	float DropScaleForItem(const UClass* ItemClass)
 	{
-		if (!ItemClass)
-		{
-			return 1.0f;
-		}
-		if (ItemClass == LoadClass<UNarrativeItem>(nullptr,
-			TEXT("/Game/Inventory/Items/BP_Item_Weapon_RustedAxe.BP_Item_Weapon_RustedAxe_C")))
-		{
-			return GWeaponAxeDropScale;
-		}
-		if (ItemClass == LoadClass<UNarrativeItem>(nullptr,
-			TEXT("/Game/Inventory/Items/BP_Item_Weapon_ApprenticeStaff.BP_Item_Weapon_ApprenticeStaff_C")))
-		{
-			return GWeaponStaffDropScale;
-		}
-		return 1.0f;
+		const UNexusWeaponItem* WeaponCDO = ItemClass ? Cast<UNexusWeaponItem>(ItemClass->GetDefaultObject()) : nullptr;
+		return WeaponCDO ? WeaponCDO->GroundScale : 1.0f;
 	}
 
 	/**
@@ -4207,6 +4187,10 @@ bool UNexusAbilityUILibrary::ToggleWeaponItemByClass(AActor* PlayerActor, TSubcl
 	}
 
 	// GetItems returns a snapshot by value, so the toggle's side effects cannot invalidate it.
+	// VARIANTS: several items of one category can share the bag, so prefer the ACTIVE match —
+	// wheel-off then always lowers exactly what is in hand; "toggle on" falls to the first
+	// inactive match in bag order.
+	UNexusWeaponItem* FirstInactive = nullptr;
 	for (UNarrativeItem* Item : RunInventory->GetItems())
 	{
 		UNexusWeaponItem* WeaponItem = Cast<UNexusWeaponItem>(Item);
@@ -4216,9 +4200,22 @@ bool UNexusAbilityUILibrary::ToggleWeaponItemByClass(AActor* PlayerActor, TSubcl
 			// slot swap -> HandleEquip/HandleUnequip (whose guards keep every state convergent).
 			// Going through the item instead of WeaponsManager.EquipWeapon keeps the bag row,
 			// the equipment slot and the weapon in hand permanently in sync.
-			WeaponItem->SetActive(!WeaponItem->bActive);
-			return true;
+			if (WeaponItem->bActive)
+			{
+				WeaponItem->SetActive(false);
+				return true;
+			}
+			if (!FirstInactive)
+			{
+				FirstInactive = WeaponItem;
+			}
 		}
+	}
+
+	if (FirstInactive)
+	{
+		FirstInactive->SetActive(true);
+		return true;
 	}
 
 	// No matching item in the bag: the hotkey no-ops, by design.

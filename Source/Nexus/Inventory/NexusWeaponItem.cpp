@@ -4,10 +4,15 @@
 
 #include "AbilitySystemComponent.h"
 #include "AbilitySystemGlobals.h"
+#include "Components/StaticMeshComponent.h"
+#include "Engine/StaticMesh.h"
 #include "GameFramework/Pawn.h"
 #include "GameplayEffect.h"
 #include "InventoryComponent.h"
 #include "UObject/UnrealType.h"
+
+/** The melee trace ends this far past the visual mesh top (the original author's tuning intent). */
+static constexpr float GTraceOvershootCm = 30.0f;
 
 UNexusWeaponItem::UNexusWeaponItem()
 {
@@ -33,6 +38,11 @@ void UNexusWeaponItem::HandleEquip_Implementation()
 		{
 			CallManagerFunction(Manager, TEXT("GiveWeapon"), *WeaponClass);
 		}
+
+		// VARIANTS: re-skin the shared category actor from THIS item's PickupMesh + tuning before
+		// EquipWeapon, so the draw montage reveals the right variant from frame one. Runs in the
+		// GUARD-1 skip case too (same class hotkey-equipped, different variant item activated).
+		ApplyVariantVisuals(Manager);
 
 		// GUARD 1: EquipWeapon toggles OFF when re-requested with the equipped class — if the
 		// hotkey already put our weapon in hand, equipping the item must not disarm the player.
@@ -167,6 +177,94 @@ bool UNexusWeaponItem::IsOurWeaponStowed(UActorComponent* Manager) const
 	}
 
 	return false;
+}
+
+AActor* UNexusWeaponItem::FindOurWeaponActor(UActorComponent* Manager) const
+{
+	// Equipped first: with multiple variants of one category, the in-hand actor is the one to re-skin.
+	if (const FObjectProperty* Prop = FindFProperty<FObjectProperty>(Manager->GetClass(), TEXT("EquippedWeapon")))
+	{
+		UObject* Equipped = Prop->GetObjectPropertyValue_InContainer(Manager);
+		if (Equipped && Equipped->GetClass()->IsChildOf(WeaponClass))
+		{
+			return Cast<AActor>(Equipped);
+		}
+	}
+
+	if (const FArrayProperty* Prop = FindFProperty<FArrayProperty>(Manager->GetClass(), TEXT("StowedWeapons")))
+	{
+		if (const FObjectPropertyBase* Inner = CastField<FObjectPropertyBase>(Prop->Inner))
+		{
+			FScriptArrayHelper Helper(Prop, Prop->ContainerPtrToValuePtr<void>(Manager));
+			for (int32 Idx = 0; Idx < Helper.Num(); ++Idx)
+			{
+				UObject* Weapon = Inner->GetObjectPropertyValue(Helper.GetRawPtr(Idx));
+				if (Weapon && Weapon->GetClass()->IsChildOf(WeaponClass))
+				{
+					return Cast<AActor>(Weapon);
+				}
+			}
+		}
+	}
+
+	return nullptr;
+}
+
+void UNexusWeaponItem::ApplyVariantVisuals(UActorComponent* Manager) const
+{
+	AActor* Weapon = FindOurWeaponActor(Manager);
+	if (!Weapon)
+	{
+		return;
+	}
+
+	// Locate the actor's components by their SCS variable names (trailing-space tolerant — this
+	// project's Blueprints have shipped names with trailing spaces before).
+	UStaticMeshComponent* MeshComponent = nullptr;
+	USceneComponent* TraceEnd = nullptr;
+	for (UActorComponent* Component : Weapon->GetComponents())
+	{
+		const FString Name = Component ? Component->GetName().TrimStartAndEnd() : FString();
+		if (Name == TEXT("WeaponMesh"))
+		{
+			MeshComponent = Cast<UStaticMeshComponent>(Component);
+		}
+		else if (Name == TEXT("TraceEnd"))
+		{
+			TraceEnd = Cast<USceneComponent>(Component);
+		}
+	}
+
+	// One field drives ground AND hand: PickupMesh is what the actor wields. If it is unset we
+	// leave the actor's design-time look alone rather than half-apply the tuning.
+	UStaticMesh* Mesh = PickupMesh.LoadSynchronous();
+	if (Mesh && MeshComponent)
+	{
+		MeshComponent->SetStaticMesh(Mesh);
+		MeshComponent->SetRelativeScale3D(FVector(InHandScale));
+		MeshComponent->SetRelativeLocation(GripOffset);
+		MeshComponent->SetRelativeRotation(GripRotation);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UNexusWeaponItem %s: variant visuals skipped (PickupMesh %s, WeaponMesh component %s)."),
+			*GetNameSafe(this), Mesh ? TEXT("ok") : TEXT("unset"), MeshComponent ? TEXT("ok") : TEXT("missing"));
+	}
+
+	// Melee trace far point tracks the variant's visual length. Derived for every weapon; inert on
+	// non-hitscan categories (the staff never runs the sphere trace).
+	if (TraceEnd)
+	{
+		float EndZ = TraceLengthOverride;
+		if (EndZ <= 0.0f && Mesh)
+		{
+			EndZ = Mesh->GetBoundingBox().Max.Z * InHandScale + GripOffset.Z + GTraceOvershootCm;
+		}
+		if (EndZ > 0.0f)
+		{
+			TraceEnd->SetRelativeLocation(FVector(0.0f, 0.0f, EndZ));
+		}
+	}
 }
 
 bool UNexusWeaponItem::CallManagerFunction(UActorComponent* Manager, FName FunctionName, UClass* ClassParam)
