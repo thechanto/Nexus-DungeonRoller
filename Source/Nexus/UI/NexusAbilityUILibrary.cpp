@@ -5,6 +5,9 @@
 #include "AbilitySystemComponent.h"
 #include "AbilitySystemInterface.h"
 #include "GameplayEffect.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/IAssetRegistry.h"
+#include "Engine/Blueprint.h"
 #include "Blueprint/UserWidget.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
 #include "Blueprint/WidgetTree.h"
@@ -2066,6 +2069,64 @@ namespace
 		}
 		return (GrantClass && GrantClass->IsChildOf(UGameplayAbility::StaticClass())) ? GrantClass : nullptr;
 	}
+
+	// The Texture2D in AbilityIcon inside the data class's S_AbilityData (mirrors the read
+	// RefreshPreview does for the preview panel). Null when the class has no such struct/field.
+	UTexture2D* ReadAbilityIcon(UClass* AbilityDataClass)
+	{
+		const UObject* DataCDO = AbilityDataClass ? AbilityDataClass->GetDefaultObject() : nullptr;
+		const FStructProperty* DataProp = AbilityDataClass
+			? CastField<FStructProperty>(FindPropByDisplayName(AbilityDataClass, TEXT("AbilityData")))
+			: nullptr;
+		if (!DataCDO || !DataProp)
+		{
+			return nullptr;
+		}
+		const void* DataPtr = DataProp->ContainerPtrToValuePtr<void>(DataCDO);
+		const FObjectPropertyBase* IconProp = CastField<FObjectPropertyBase>(
+			FindPropByDisplayName(DataProp->Struct, TEXT("AbilityIcon")));
+		return IconProp
+			? Cast<UTexture2D>(IconProp->GetObjectPropertyValue_InContainer(DataPtr))
+			: nullptr;
+	}
+
+	// Ability data class paths ("..._C") under the DataAssets folder, scanned once from the
+	// asset registry and cached. Paths (not UClass*) are cached so nothing here keeps a class
+	// alive or dangles across GC; each is cheaply re-resolved via LoadClass (a FindObject hit
+	// once loaded) at the icon-lookup site.
+	const TArray<FString>& GetAbilityDataClassPaths()
+	{
+		static TArray<FString> Cached;
+		static bool bBuilt = false;
+		if (bBuilt)
+		{
+			return Cached;
+		}
+		bBuilt = true;
+
+		IAssetRegistry* AssetRegistry = IAssetRegistry::Get();
+		if (!AssetRegistry)
+		{
+			UE_LOG(LogNexusAbilityUI, Warning,
+				TEXT("GetAbilityDataClassPaths: AssetRegistry unavailable; ability-icon fallback disabled"));
+			return Cached;
+		}
+
+		FARFilter Filter;
+		Filter.PackagePaths.Add(FName(TEXT("/Game/GameplayAbilitySystem/Abilities/DataAssets")));
+		Filter.bRecursivePaths = true;
+		Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
+
+		TArray<FAssetData> Assets;
+		AssetRegistry->GetAssets(Filter, Assets);
+		for (const FAssetData& Asset : Assets)
+		{
+			Cached.Add(Asset.GetObjectPathString() + TEXT("_C"));
+		}
+		UE_LOG(LogNexusAbilityUI, Log, TEXT("GetAbilityDataClassPaths: cached %d ability data class(es)"),
+			Cached.Num());
+		return Cached;
+	}
 }
 
 bool UNexusAbilityUILibrary::AssignAbilityToSlot(const UObject* WorldContextObject,
@@ -2290,6 +2351,50 @@ int32 UNexusAbilityUILibrary::GrantAssignedAbilities(ACharacter* Character)
 	UE_LOG(LogNexusAbilityUI, Log, TEXT("GrantAssignedAbilities: granted %d ability(ies) to %s, cleared %d stale"),
 		GrantedCount, *Character->GetName(), StaleHandles.Num());
 	return GrantedCount;
+}
+
+EAbilityInputID UNexusAbilityUILibrary::GetGrantedAbilityInputID(UAbilitySystemComponent* ASC,
+	FGameplayAbilitySpecHandle Handle)
+{
+	if (!ASC || !Handle.IsValid())
+	{
+		return EAbilityInputID::None;
+	}
+	const FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromHandle(Handle);
+	if (!Spec)
+	{
+		return EAbilityInputID::None;
+	}
+	// Spec InputID is the same integer space as EAbilityInputID (0-8); guard the range so an
+	// unexpected value reads as None rather than an out-of-range enum cast.
+	const int32 InputID = Spec->InputID;
+	if (InputID < 0 || InputID > static_cast<int32>(EAbilityInputID::Ability4))
+	{
+		return EAbilityInputID::None;
+	}
+	return static_cast<EAbilityInputID>(InputID);
+}
+
+UTexture2D* UNexusAbilityUILibrary::GetAbilityIconForAbility(UGameplayAbility* Ability)
+{
+	UClass* GAClass = Ability ? Ability->GetClass() : nullptr;
+	if (!GAClass)
+	{
+		return nullptr;
+	}
+	for (const FString& Path : GetAbilityDataClassPaths())
+	{
+		UClass* DataClass = LoadClass<UObject>(nullptr, *Path);
+		if (!DataClass)
+		{
+			continue;
+		}
+		if (ResolveGrantedAbilityClass(DataClass) == GAClass)
+		{
+			return ReadAbilityIcon(DataClass);
+		}
+	}
+	return nullptr;
 }
 
 

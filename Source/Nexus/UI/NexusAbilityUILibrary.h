@@ -6,6 +6,8 @@
 #include "Blueprint/UserWidget.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "Templates/SubclassOf.h"
+#include "GameplayAbilitySpecHandle.h"
+#include "Nexus/GameplayAbilitySystem/Abilities/NexusGameplayAbility.h"
 #include "NexusAbilityUILibrary.generated.h"
 
 class UButton;
@@ -14,6 +16,8 @@ class UGameplayAbility;
 class UGameplayEffect;
 class UNexusAbilityPreviewController;
 class UNexusStatsPanel;
+class UAbilitySystemComponent;
+class UTexture2D;
 
 /**
  * Which flask the player is drinking. The enumerator ORDER must stay aligned with the
@@ -180,6 +184,31 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Nexus|UI")
 	static int32 GrantAssignedAbilities(class ACharacter* Character);
+
+	/**
+	 * Item-2 HUD badge source: the input slot the ability was actually GRANTED on, read from
+	 * the live FGameplayAbilitySpec (its runtime InputID) rather than the ability CDO's static
+	 * AbilityInputID. The warrior/mage class abilities leave the CDO field at None and are bound
+	 * to a keybind slot only at grant time (GrantAssignedAbilities sets spec InputID = Ability1-4),
+	 * so W_Ability must key its keybind glyph off the spec, not the CDO. W_Ability already carries
+	 * the AbilitySpecHandle it was spawned with; pass that plus the owning pawn's ASC. Returns
+	 * None when the ASC/handle is invalid or the spec InputID falls outside EAbilityInputID.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Nexus|UI")
+	static EAbilityInputID GetGrantedAbilityInputID(UAbilitySystemComponent* ASC,
+		FGameplayAbilitySpecHandle Handle);
+
+	/**
+	 * Item-2 icon fallback: the ability's own authored icon, read from S_AbilityData.AbilityIcon
+	 * on the DA whose AbilityData.AbilityClass resolves to the given ability's class. Lets
+	 * W_Ability show an icon for abilities that have no DT_AbilityMetaData row (the warrior/mage
+	 * class abilities), so SetAbilityImage can fall back here on a row miss. The DA class paths
+	 * under /Game/GameplayAbilitySystem/Abilities/DataAssets are scanned from the asset registry
+	 * once and cached; the icon is read fresh from the matching DA CDO each call. Null when no
+	 * DA maps to the ability's class.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Nexus|UI")
+	static UTexture2D* GetAbilityIconForAbility(UGameplayAbility* Ability);
 
 	/**
 	 * Tooling: exports TargetClass's CDO property to its text form (FProperty::ExportText).
