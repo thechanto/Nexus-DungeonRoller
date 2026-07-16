@@ -515,7 +515,11 @@ public:
 
 	/**
 	 * Extraction game: moves every RunInventory item into Stash, then writes Stash to the
-	 * "NexusStash" save slot. Each item is added to the stash first and only consumed from
+	 * "NexusStash" save slot. Deactivates every active item first (SetActive(false) -> the
+	 * equipped weapon is lowered and its stats effect removed): extraction ends the loadout,
+	 * and a bActive=true flag round-tripping through the stash save would re-equip the weapon
+	 * straight out of the STASH on next session's Load(). Each item is added to the stash first
+	 * and only consumed from
 	 * the run inventory for the amount the stash actually accepted (AmountGiven), so a full
 	 * stash leaves loot in the run inventory rather than voiding it. Run currency is folded
 	 * into the stash. Returns false when any item was partially/fully rejected or the save
@@ -531,6 +535,32 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Nexus|Extraction", meta = (DefaultToSelf = "PlayerActor"))
 	static bool LoadStash(AActor* PlayerActor);
+
+	/**
+	 * Loadout: grants the two starting weapon items (rusted axe, apprentice's staff) to the run
+	 * inventory. Replaces WeaponsManager's StartingWeapons pre-stow -- weapons now only ever
+	 * arrive as ITEMS and reach the hand by equipping one. Call on BeginPlay AFTER LoadStash:
+	 * the dedupe guard reads the stash, and a weapon item already held in the run inventory or
+	 * the stash (equipped/hidden copies included) is not seeded again, so extracting every run
+	 * does not pile up free axes. Returns the number of items granted (0-2).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Equipment", meta = (DefaultToSelf = "PlayerActor"))
+	static int32 SeedStartingWeaponItems(AActor* PlayerActor);
+
+	/**
+	 * Loadout: the hotkey path. Finds the first UNexusWeaponItem in the run inventory whose
+	 * WeaponClass matches and toggles its active state; the item rails then do everything a bag
+	 * "Equip" click does (equipment-slot swap, HandleEquip/HandleUnequip guards, weapon draw,
+	 * bag-row hide/show). GA_EquipWeapon calls this INSTEAD of WeaponsManager.EquipWeapon so
+	 * hotkeys and bag clicks share one path and item active state can never drift from the
+	 * weapon in hand. Returns false (touching nothing) when no matching item is in the bag:
+	 * the hotkey for an unowned weapon no-ops, by design.
+	 *
+	 * No DefaultToSelf: the caller is a GA graph, whose self is not an Actor -- wire
+	 * GetAvatarActorFromActorInfo into PlayerActor (pawn/controller/player state all resolve).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Equipment")
+	static bool ToggleWeaponItemByClass(AActor* PlayerActor, TSubclassOf<AActor> WeaponClass);
 
 	/**
 	 * The shared finisher gate, used by every cinematic finisher (Sky Crusher, Burden). Passes only

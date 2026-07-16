@@ -39,6 +39,7 @@
 #include "GameFramework/SaveGame.h"
 #include "InventoryComponent.h"
 #include "NarrativeItem.h"
+#include "Nexus/Inventory/NexusWeaponItem.h"
 #include "Nexus/UI/NexusInventoryUIComponent.h"
 #include "HAL/FileManager.h"
 #include "Kismet/GameplayStatics.h"
@@ -4070,6 +4071,18 @@ bool UNexusAbilityUILibrary::ExtractRunInventoryToStash(AActor* PlayerActor)
 		return false;
 	}
 
+	// Unequip everything before banking: extraction ends the loadout, and an item saved with
+	// bActive=true would re-equip itself out of the STASH on next session's Load(). Deactivating
+	// through SetActive walks the full unequip rails (HandleUnequip -> weapon lowered, stats
+	// effect removed, bag refresh) and is a no-op on inactive items.
+	for (UNarrativeItem* Item : RunInventory->GetItems())
+	{
+		if (IsValid(Item) && Item->bActive)
+		{
+			Item->SetActive(false);
+		}
+	}
+
 	bool bMovedEverything = true;
 
 	const TArray<UNarrativeItem*> Items = RunInventory->GetItems();
@@ -4130,6 +4143,88 @@ bool UNexusAbilityUILibrary::LoadStash(AActor* PlayerActor)
 	UE_LOG(LogNexusAbilityUI, Log, TEXT("LoadStash: %s (%d stack(s), %d currency)"),
 		bLoaded ? TEXT("loaded") : TEXT("no save yet"), Stash->GetItems().Num(), Stash->GetCurrency());
 	return bLoaded;
+}
+
+int32 UNexusAbilityUILibrary::SeedStartingWeaponItems(AActor* PlayerActor)
+{
+	UNarrativeInventoryComponent* RunInventory = FindPlayerInventory(PlayerActor, RunInventoryName);
+	if (!RunInventory)
+	{
+		return 0;
+	}
+
+	// The stash may be missing or not yet loaded (first run); it then vetoes nothing.
+	UNarrativeInventoryComponent* Stash = FindPlayerInventory(PlayerActor, StashName);
+
+	const ENexusLootType StartingWeapons[] =
+	{
+		ENexusLootType::WeaponRustedAxe,
+		ENexusLootType::WeaponApprenticeStaff
+	};
+
+	int32 Granted = 0;
+	for (const ENexusLootType Type : StartingWeapons)
+	{
+		const FLootFields& Fields = LootFields(Type);
+		UClass* ItemClass = LoadClass<UNarrativeItem>(nullptr, Fields.ItemPath);
+		if (!ItemClass)
+		{
+			UE_LOG(LogNexusAbilityUI, Error, TEXT("SeedStartingWeaponItems: cannot load %s"), Fields.ItemPath);
+			continue;
+		}
+
+		// Dedupe: bCheckVisibility stays false so an EQUIPPED copy (hidden from the bag list by
+		// ShouldShowInInventory) still counts as owned.
+		const TSoftClassPtr<UNarrativeItem> SoftClass(ItemClass);
+		if (RunInventory->HasItem(SoftClass) || (Stash && Stash->HasItem(SoftClass)))
+		{
+			continue;
+		}
+
+		// bCheckAutoUse=false: seeding must never auto-equip.
+		if (RunInventory->TryAddItemFromClass(ItemClass, 1, false).AmountGiven > 0)
+		{
+			++Granted;
+		}
+	}
+
+	UE_LOG(LogNexusAbilityUI, Log, TEXT("SeedStartingWeaponItems: granted %d starting weapon item(s) to %s"),
+		Granted, *GetNameSafe(PlayerActor));
+	return Granted;
+}
+
+bool UNexusAbilityUILibrary::ToggleWeaponItemByClass(AActor* PlayerActor, TSubclassOf<AActor> WeaponClass)
+{
+	if (!WeaponClass)
+	{
+		return false;
+	}
+
+	UNarrativeInventoryComponent* RunInventory = FindPlayerInventory(PlayerActor, RunInventoryName);
+	if (!RunInventory)
+	{
+		return false;
+	}
+
+	// GetItems returns a snapshot by value, so the toggle's side effects cannot invalidate it.
+	for (UNarrativeItem* Item : RunInventory->GetItems())
+	{
+		UNexusWeaponItem* WeaponItem = Cast<UNexusWeaponItem>(Item);
+		if (WeaponItem && WeaponItem->WeaponClass && WeaponItem->WeaponClass->IsChildOf(WeaponClass))
+		{
+			// SetActive drives the full item rails: Activated/Deactivated -> EquipmentComponent
+			// slot swap -> HandleEquip/HandleUnequip (whose guards keep every state convergent).
+			// Going through the item instead of WeaponsManager.EquipWeapon keeps the bag row,
+			// the equipment slot and the weapon in hand permanently in sync.
+			WeaponItem->SetActive(!WeaponItem->bActive);
+			return true;
+		}
+	}
+
+	// No matching item in the bag: the hotkey no-ops, by design.
+	UE_LOG(LogNexusAbilityUI, Log, TEXT("ToggleWeaponItemByClass: no item for %s in %s's bag"),
+		*WeaponClass->GetName(), *GetNameSafe(PlayerActor));
+	return false;
 }
 
 /** Sky Crusher only finishes wounded enemies. */
