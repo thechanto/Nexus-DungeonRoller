@@ -1,9 +1,8 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
 #include "NexusMainMenu.h"
+#include "NexusStashView.h"		// LogStashView (DECLARE_LOG_CATEGORY_EXTERN); DEFINE lives in NexusStashView.cpp
 #include "Components/Button.h"
-
-DEFINE_LOG_CATEGORY_STATIC(LogStashView, Log, All);
 
 void UNexusMainMenu::NativeConstruct()
 {

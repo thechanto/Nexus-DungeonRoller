@@ -11,7 +11,7 @@
 #include "InventoryComponent.h"
 #include "UObject/UnrealType.h"
 
-DEFINE_LOG_CATEGORY_STATIC(LogStashView, Log, All);
+DEFINE_LOG_CATEGORY(LogStashView);
 
 TSharedRef<SWidget> UNexusStashView::RebuildWidget()
 {

@@ -9,6 +9,9 @@
 
 class UButton;
 
+/** Owned here (StashView logs to it most); NexusMainMenu.cpp logs to it too via this extern. */
+NEXUS_API DECLARE_LOG_CATEGORY_EXTERN(LogStashView, Log, All);
+
 /**
  * Read-only stash browser for the main menu. The widget tree is built in C++ at runtime
  * (RebuildWidget) because scripting cannot give a factory-created WidgetBlueprint a root
