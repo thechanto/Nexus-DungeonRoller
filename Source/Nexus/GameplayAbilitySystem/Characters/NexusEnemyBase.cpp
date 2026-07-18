@@ -104,6 +104,20 @@ void ANexusEnemyBase::RemoveAbilities(TArray<FGameplayAbilitySpecHandle> Ability
 	}
 }
 
+void ANexusEnemyBase::CancelAllActiveAbilities()
+{
+	if (AbilitySystemComponent)
+	{
+		AbilitySystemComponent->CancelAllAbilities();
+	}
+}
+
+void ANexusEnemyBase::DisableCorpseCollision()
+{
+	GetCapsuleComponent()->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	GetCharacterMovement()->DisableMovement();
+}
+
 void ANexusEnemyBase::HandleDeath_Implementation()
 {
 	GetMesh()->SetSimulatePhysics(true);

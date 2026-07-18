@@ -34,6 +34,7 @@
 #include "Particles/ParticleSystem.h"
 #include "TimerManager.h"
 #include "GameFramework/Character.h"
+#include "GameFramework/GameModeBase.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
 #include "GameFramework/SaveGame.h"
@@ -54,6 +55,7 @@
 #include "Nexus/GameplayAbilitySystem/AttributeSets/BasicAttributeSet.h"
 #include "Nexus/GameplayAbilitySystem/Abilities/NexusFinisherDirector.h"
 #include "Nexus/GameplayAbilitySystem/Characters/NexusCharacterBase.h"
+#include "Nexus/GameplayAbilitySystem/Characters/NexusEnemyBase.h"
 #include "Nexus/GameplayAbilitySystem/Characters/NexusLockOnComponent.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogNexusAbilityUI, Log, All);
@@ -3258,6 +3260,17 @@ AActor* UNexusAbilityUILibrary::SpawnLootDrop(AActor* DeadEnemy, float DropChanc
 	return Pickup;
 }
 
+bool UNexusAbilityUILibrary::IsActorDeadEnemy(AActor* Actor)
+{
+	const ANexusEnemyBase* Enemy = Cast<ANexusEnemyBase>(Actor);
+	if (!Enemy || !Enemy->BasicAttributeSet)
+	{
+		return false;
+	}
+
+	return Enemy->BasicAttributeSet->GetHealth() <= 0.0f;
+}
+
 void UNexusAbilityUILibrary::SpawnBossLoot(AActor* DeadBoss, float RingRadius, int32 BossGold)
 {
 	if (!DeadBoss || !DeadBoss->HasAuthority())
@@ -3687,6 +3700,7 @@ namespace
 	const FName RunInventoryName(TEXT("RunInventory"));
 	const FName StashName(TEXT("Stash"));
 	const TCHAR* StashSaveSlot = TEXT("NexusStash");
+	const TCHAR* LoadoutSaveSlot = TEXT("NexusLoadout");
 
 	/** Pawn / controller / player state -> player state. */
 	APlayerState* ResolvePlayerState(AActor* PlayerActor)
@@ -4123,6 +4137,130 @@ bool UNexusAbilityUILibrary::LoadStash(AActor* PlayerActor)
 	UE_LOG(LogNexusAbilityUI, Log, TEXT("LoadStash: %s (%d stack(s), %d currency)"),
 		bLoaded ? TEXT("loaded") : TEXT("no save yet"), Stash->GetItems().Num(), Stash->GetCurrency());
 	return bLoaded;
+}
+
+bool UNexusAbilityUILibrary::OpenStashLoadout(AActor* PlayerActor)
+{
+	UNarrativeInventoryComponent* RunInventory = FindPlayerInventory(PlayerActor, RunInventoryName);
+	UNarrativeInventoryComponent* Stash = FindPlayerInventory(PlayerActor, StashName);
+	if (!RunInventory || !Stash)
+	{
+		return false;
+	}
+
+	// Exactly the chest flow (OpenContainerLoot) with the stash in the chest inventory's place:
+	// the looting menu reads GetOwningPlayer's RunInventory + its LootSource on its own.
+	RunInventory->SetLootSource(Stash);
+
+	APlayerController* PC = nullptr;
+	if (const APawn* Pawn = Cast<APawn>(PlayerActor))
+	{
+		PC = Cast<APlayerController>(Pawn->GetController());
+	}
+	else if (APlayerController* AsPC = Cast<APlayerController>(PlayerActor))
+	{
+		PC = AsPC;
+	}
+	if (!PC)
+	{
+		PC = UGameplayStatics::GetPlayerController(PlayerActor, 0);
+	}
+
+	UNexusInventoryUIComponent* UI = PC ? PC->FindComponentByClass<UNexusInventoryUIComponent>() : nullptr;
+	if (!UI)
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("OpenStashLoadout: no UNexusInventoryUIComponent on %s"),
+			*GetNameSafe(PC));
+		return false;
+	}
+
+	UI->OpenLootMenu();
+	UE_LOG(LogNexusAbilityUI, Log, TEXT("OpenStashLoadout: stash browser opened (stash %d stack(s), basket %d)"),
+		Stash->GetItems().Num(), RunInventory->GetItems().Num());
+	return true;
+}
+
+bool UNexusAbilityUILibrary::SaveStashAndLoadout(AActor* PlayerActor)
+{
+	UNarrativeInventoryComponent* RunInventory = FindPlayerInventory(PlayerActor, RunInventoryName);
+	UNarrativeInventoryComponent* Stash = FindPlayerInventory(PlayerActor, StashName);
+	if (!RunInventory || !Stash)
+	{
+		return false;
+	}
+
+	// Stash FIRST: a crash between the two writes then loses the in-flight items instead of
+	// leaving them in both saves (see header).
+	const bool bStashSaved = Stash->Save(StashSaveSlot);
+	const bool bLoadoutSaved = RunInventory->Save(LoadoutSaveSlot);
+
+	if (!bStashSaved || !bLoadoutSaved)
+	{
+		UE_LOG(LogNexusAbilityUI, Error, TEXT("SaveStashAndLoadout: save failed (stash: %s, loadout: %s)"),
+			bStashSaved ? TEXT("ok") : TEXT("FAILED"), bLoadoutSaved ? TEXT("ok") : TEXT("FAILED"));
+		return false;
+	}
+
+	UE_LOG(LogNexusAbilityUI, Log, TEXT("SaveStashAndLoadout: stash %d stack(s)/%d gold, loadout %d stack(s)"),
+		Stash->GetItems().Num(), Stash->GetCurrency(), RunInventory->GetItems().Num());
+	return true;
+}
+
+bool UNexusAbilityUILibrary::LoadRunLoadout(AActor* PlayerActor)
+{
+	UNarrativeInventoryComponent* RunInventory = FindPlayerInventory(PlayerActor, RunInventoryName);
+	if (!RunInventory)
+	{
+		return false;
+	}
+
+	// Load() returns false for a missing slot without touching the inventory (no loadout saved).
+	const bool bLoaded = RunInventory->Load(LoadoutSaveSlot);
+	if (!bLoaded)
+	{
+		return false;
+	}
+
+	// The front end (no DefaultPawnClass on its game mode) only previews the slot into the
+	// basket; run levels consume it so it can never re-grant (see header).
+	const UWorld* World = PlayerActor->GetWorld();
+	const AGameModeBase* GameMode = World ? World->GetAuthGameMode() : nullptr;
+	const bool bFrontEnd = GameMode && !GameMode->DefaultPawnClass;
+	if (!bFrontEnd)
+	{
+		RunInventory->DeleteSave(LoadoutSaveSlot);
+	}
+
+	UE_LOG(LogNexusAbilityUI, Log, TEXT("LoadRunLoadout: %d stack(s) into RunInventory (%s)"),
+		RunInventory->GetItems().Num(), bFrontEnd ? TEXT("front end, slot kept") : TEXT("run, slot consumed"));
+	return true;
+}
+
+void UNexusAbilityUILibrary::BindStashLoadoutButton(UUserWidget* MenuWidget, FName ButtonName)
+{
+	if (!MenuWidget)
+	{
+		return;
+	}
+
+	UButton* Button = Cast<UButton>(MenuWidget->GetWidgetFromName(ButtonName));
+	if (!Button)
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("BindStashLoadoutButton: no UButton '%s' in %s"),
+			*ButtonName.ToString(), *GetNameSafe(MenuWidget));
+		return;
+	}
+
+	APlayerController* PC = MenuWidget->GetOwningPlayer();
+	UNexusInventoryUIComponent* UI = PC ? PC->FindComponentByClass<UNexusInventoryUIComponent>() : nullptr;
+	if (!UI)
+	{
+		UE_LOG(LogNexusAbilityUI, Warning, TEXT("BindStashLoadoutButton: no UNexusInventoryUIComponent on %s"),
+			*GetNameSafe(PC));
+		return;
+	}
+
+	Button->OnClicked.AddUniqueDynamic(UI, &UNexusInventoryUIComponent::OpenStashLoadoutMenu);
 }
 
 int32 UNexusAbilityUILibrary::SeedStartingWeaponItems(AActor* PlayerActor)

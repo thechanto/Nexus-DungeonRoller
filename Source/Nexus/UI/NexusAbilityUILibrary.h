@@ -356,6 +356,15 @@ public:
 	static void SpawnBossLoot(AActor* DeadBoss, float RingRadius = 150.0f, int32 BossGold = 100);
 
 	/**
+	 * True only when Actor is an enemy whose Health has already hit zero. Anything else --
+	 * null, the player, a level-placed trap -- reads false, so callers can gate on "my
+	 * instigator is a corpse" without special-casing every other kind of instigator.
+	 * Used by BP_AOE_Base to stop damage fields that outlive the enemy that cast them.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Nexus|Combat")
+	static bool IsActorDeadEnemy(AActor* Actor);
+
+	/**
 	 * Puts a dropped item on the ground in front of the player, for the inventory's drop actions.
 	 *
 	 * Spawns BP_DroppedItemPickup -- ours, not the plugin's BP_BasicItemPickup. Dropped items are
@@ -535,6 +544,60 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Nexus|Extraction", meta = (DefaultToSelf = "PlayerActor"))
 	static bool LoadStash(AActor* PlayerActor);
+
+	/**
+	 * Main-menu loadout: opens the Narrative looting menu with the STASH as the loot source. The
+	 * two looting panes become the stash browser: "their" side shows the Stash component, "your"
+	 * side shows RunInventory, which at the front end doubles as the loadout basket -- items
+	 * clicked across move between the two components on the same RequestLootItem rails the chest
+	 * flow uses. Front-end only by nature (it needs the player state components, which the menu
+	 * game mode provides via PlayerStateClass = BP_NexusPlayerState), but nothing here persists:
+	 * moves are component state only, and quitting the menu forgets them. SaveStashAndLoadout on
+	 * the Play click is the one commit point.
+	 *
+	 * No DefaultToSelf: callers are widgets/components, whose self is not an Actor.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Loadout")
+	static bool OpenStashLoadout(AActor* PlayerActor);
+
+	/**
+	 * Main-menu loadout: the Play-click commit, spliced BEFORE Open Level. Writes the Stash
+	 * component to "NexusStash" (debiting whatever was moved into the basket) and then the
+	 * RunInventory basket to "NexusLoadout". Stash is written FIRST on purpose: a crash between
+	 * the two writes loses the in-flight items instead of duplicating them (loadout-first would
+	 * leave the items in BOTH saves). Returns false when either save failed; the caller may
+	 * still travel -- a failed save means the run simply starts from the old slots.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Loadout")
+	static bool SaveStashAndLoadout(AActor* PlayerActor);
+
+	/**
+	 * Main-menu loadout: loads the "NexusLoadout" slot into RunInventory. Splice into the player
+	 * state's BeginPlay between LoadStash and SeedStartingWeaponItems -- after LoadStash because
+	 * both saves are written together, before the seeder so its dedupe guard sees brought
+	 * weapons and vetoes the free copies. The plugin's Load() REPLACES the component's contents,
+	 * which is correct here: RunInventory is empty at BeginPlay in both levels.
+	 *
+	 * The slot outlives the menu but not the run: at the front end (recognised by the game mode
+	 * having no DefaultPawnClass) the slot is loaded into the basket and KEPT, so browsing the
+	 * menu and quitting can never destroy a crash-recovered loadout -- Play rewrites the slot
+	 * from the basket anyway. In a run level the slot is loaded and CONSUMED, so the items exist
+	 * only in the run from that point on: dying loses them (ClearRunInventory), extracting banks
+	 * them (ExtractRunInventoryToStash), and a stale slot can never re-grant them.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Loadout", meta = (DefaultToSelf = "PlayerActor"))
+	static bool LoadRunLoadout(AActor* PlayerActor);
+
+	/**
+	 * Main menu: binds the button named ButtonName inside MenuWidget to the owning controller's
+	 * UNexusInventoryUIComponent::OpenStashLoadoutMenu. Splice into W_MainMenu's Construct chain
+	 * (DefaultToSelf fills MenuWidget). Exists because our tooling cannot create component-bound
+	 * OnClicked events in a widget graph; the button is resolved with GetWidgetFromName, so the
+	 * new tree widget needs no "Is Variable" tick either. AddUniqueDynamic keeps a re-fired
+	 * Construct from stacking bindings. Logs and no-ops when the button or component is missing.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|Loadout", meta = (DefaultToSelf = "MenuWidget"))
+	static void BindStashLoadoutButton(UUserWidget* MenuWidget, FName ButtonName);
 
 	/**
 	 * Loadout: grants the two starting weapon items (rusted axe, apprentice's staff) to the run

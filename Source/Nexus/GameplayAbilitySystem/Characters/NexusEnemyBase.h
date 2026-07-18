@@ -51,4 +51,13 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "AbilitySystem")
 	void RemoveAbilities(TArray<FGameplayAbilitySpecHandle> AbilityHandlesToRemove);
+
+	// UAbilitySystemComponent::CancelAllAbilities is not BlueprintCallable — the death chain
+	// needs this so attack abilities stop dealing damage once the enemy is dead.
+	UFUNCTION(BlueprintCallable, Category = "AbilitySystem")
+	void CancelAllActiveAbilities();
+
+	// GetCapsuleComponent has no UFUNCTION, so the corpse cleanup lives here.
+	UFUNCTION(BlueprintCallable, Category = "Damage")
+	void DisableCorpseCollision();
 };
