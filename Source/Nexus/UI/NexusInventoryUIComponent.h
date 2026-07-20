@@ -63,6 +63,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Nexus|UI")
 	void OpenLootMenu();
 
+	/** Opens the looting menu with the STASH as the loot source: the front-end stash/loadout
+	 * browser. Thin wrapper over UNexusAbilityUILibrary::OpenStashLoadout so W_MainMenu's Stash
+	 * button has a UObject method to bind OnClicked to (see BindStashLoadoutButton). */
+	UFUNCTION(BlueprintCallable, Category = "Nexus|UI")
+	void OpenStashLoadoutMenu();
+
 	UFUNCTION(BlueprintPure, Category = "Nexus|UI")
 	UUserWidget* GetHUDWidget() const { return HUDWidget; }
 

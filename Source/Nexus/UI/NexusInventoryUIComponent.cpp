@@ -10,6 +10,7 @@
 #include "GameFramework/PlayerController.h"
 #include "Input/CommonUIInputTypes.h"
 #include "InputAction.h"
+#include "Nexus/UI/NexusAbilityUILibrary.h"
 
 UNexusInventoryUIComponent::UNexusInventoryUIComponent()
 {
@@ -136,6 +137,11 @@ void UNexusInventoryUIComponent::OpenLootMenu()
 	// (CommonUI) or when looting ends (OnEndLooting). We do not track it as OpenMenuWidget
 	// so the I-key inventory toggle stays independent of an open loot menu.
 	OpenMenuByClass(LootMenuClass);
+}
+
+void UNexusInventoryUIComponent::OpenStashLoadoutMenu()
+{
+	UNexusAbilityUILibrary::OpenStashLoadout(GetOwner());
 }
 
 void UNexusInventoryUIComponent::CloseInventoryMenu()
