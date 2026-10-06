@@ -1,27 +1,38 @@
-# Nexus: online co-op redesign (Solo Leveling style, Arc Raiders shape) — spec draft
+# Nexus: dungeon-conquest co-op redesign (Solo Leveling / Tower of God / Tensura dungeon) — spec draft
 
 Date: 2026-10-06. Status: draft for Niko's review; written by Claude (Fable 5.1) from Niko's answers
 on 2026-10-06 in the Aide terminal. Nothing below is built. Decision recorded in Aide's vault on
 2026-09-24: change the design toward a Solo Leveling-style online multiplayer co-op game with crossplay.
 
 Niko's answers (2026-10-06): up to 5 players in a party, bigger counts later for events; PvE and
-PvP; crossplay PC and console; lobby-based sessions like Arc Raiders.
+PvP; crossplay PC and console; lobby-based sessions like Arc Raiders. The fantasy is NOT "Arc Raiders
+in medieval clothes": it is Solo Leveling and Tower of God, and closest of all the dungeon in "That
+Time I Got Reincarnated as a Slime": a nation builds and runs a many-floored underground dungeon, and
+parties go in to conquer it floor by floor.
 
 ## 1. Product (the PRD)
 
-- **User problem:** Nexus today is a single-player UE 5.7 extraction prototype (one dungeon map, a
-  boss, extraction banks loot, death forfeits it). Niko wants the same tension with friends: a party
-  of up to 5 drops into a raid together, fights PvE, meets other parties (PvP), and extracts.
-- **Success criterion (measurable):** two players on two PCs join one lobby, drop into
-  `LV_Soul_Cave` together, kill the boss, and both extract with their loot banked, over the internet,
-  in 5 of 5 attempts; no desync visible in a 10-minute session (positions, health, loot).
-- **Launch note:** Nexus becomes a small-party extraction raider: lobby up, pick a raid, fight the
-  dungeon and whoever else dropped in, get out alive or lose the run. First on PC, built from day
-  one on a service layer that supports consoles, so crossplay is a platform contract later, not a
-  rewrite.
-- **Out of scope for this spec:** console builds and certification, large events (more than 5 per
-  party), monetisation, anti-cheat, voice chat, progression rebalance for groups. Named so the
-  framework fits them; each is its own spec.
+- **The fantasy (the change from the prototype):** a hub nation with one great Dungeon beneath it.
+  The Dungeon has floors; each floor is a cleared-or-not space with its own enemies, a floor boss and
+  a gate to the next floor. Hunters are ranked (E to S) by what they have cleared. A party of up to 5
+  descends from the deepest floor it has unlocked, fights the floor (PvE), may meet rival parties on
+  contested floors (PvP), and must return to a gate to bank what it found; dying on a floor loses the
+  run's unbanked loot and XP, exactly the extraction tension the prototype already has. Conquering a
+  floor boss as a party unlocks the next floor for every member and raises their rank. The hub shows
+  the Dungeon's state: floors conquered, records, rankings.
+- **What survives from the prototype:** `LV_Soul_Cave` becomes Floor 1; its boss becomes the first
+  floor boss; chests, loot, GAS attributes, the extraction mechanic (now "return to the gate") all stay.
+- **User problem:** Nexus today is single-player. Niko wants the Dungeon conquered by parties of
+  friends, with rivalry between parties, from PC and later console.
+- **Success criterion (measurable):** two players on two PCs join one lobby in the hub, descend to
+  Floor 1 together, kill the floor boss, both return to the gate with loot banked and Floor 2
+  unlocked for both, over the internet, in 5 of 5 attempts; no visible desync in a 10-minute run.
+- **Launch note:** Nexus is a party dungeon-conquest game: a nation's great Dungeon, floors to
+  conquer, ranks to earn, rival parties to beat to the gate. First on PC, on a service layer that
+  supports consoles from day one.
+- **Out of scope for this spec:** console builds and certification, events with more than 5 per
+  party (raid bosses for many parties), the nation layer as a game system (building the Dungeon,
+  economy), monetisation, anti-cheat, voice chat. Each is its own spec later.
 
 ## 2. Architecture
 
@@ -30,16 +41,20 @@ PvP; crossplay PC and console; lobby-based sessions like Arc Raiders.
      (Epic account on PC, platform accounts on console later), lobbies, sessions, P2P or
      dedicated-server connection, crossplay by design. Free. The one choice that makes "console
      later" possible without redoing lobbies.
-  2. **Lobby:** `Lvl_MainMenu` gains Create / Join / Invite; a lobby of 1 to 5 players; ready-up;
-     the host picks the raid map; the party travels together (seamless travel, listen server first).
-  3. **Raid session:** one authoritative server (host-listen in slice 1, dedicated later), the
-     current `LV_Soul_Cave` loop replicated: enemies, boss, chests, loot drops, extraction points.
+  2. **Hub and lobby:** `Lvl_MainMenu` becomes the hub (the nation above the Dungeon): party
+     Create / Join / Invite, 1 to 5 players, ready-up; the host picks a floor the whole party has
+     unlocked; the party travels together (seamless travel, listen server first).
+  3. **Floor session:** one authoritative server (host-listen in slice 1, dedicated later), the
+     current `LV_Soul_Cave` loop replicated as Floor 1: enemies, floor boss, chests, loot drops, gates
+     (the extraction points). Clearing the floor boss unlocks the next floor for every party member.
   4. **PvP:** other parties can be placed into the same raid when the server has room (up to 2 or 3
      parties per instance in later slices); friendly fire off inside a party, on across parties.
   5. **Persistence:** stash and banked XP per player, saved server-side (EOS Player Data Storage or
      a tiny backend) so loot survives across sessions and devices.
 - **Data:**
-  - `PartyState` (replicated): members, ready flags, chosen map.
+  - `DungeonProgress` (per player, saved): deepest floor unlocked, floors conquered with dates, rank.
+  - `FloorDefinition` (data asset per floor): map, enemy set, floor boss class, gates, PvP allowed.
+  - `PartyState` (replicated): members, ready flags, chosen floor.
   - `RaidState` (replicated): phase (loading, live, extraction window, ended), timer, extraction
     points open/closed.
   - Player save: stash inventory, banked XP, level, cosmetic unlocks (JSON blob per EOS product
@@ -97,13 +112,16 @@ PvP; crossplay PC and console; lobby-based sessions like Arc Raiders.
 
 ## 4. Slices
 
-1. **Two players, one raid, LAN/listen.** Replicate the existing loop for 2 players over a listen
-   server; lobby = a direct join by address. Usable: a friend plays the dungeon with Niko.
+1. **Two players, Floor 1, LAN/listen.** Replicate the existing loop for 2 players over a listen
+   server; lobby = a direct join by address; the boss kill unlocks "Floor 2" as a saved flag.
+   Usable: a friend conquers Floor 1 with Niko.
 2. **EOS lobby and sessions.** Login, create/join/invite, ready-up, travel together; party of 5.
 3. **Cloud stash.** Banked loot and XP survive sessions and machines.
-4. **PvP: two parties per raid.** Team flags, friendly fire rules, extraction contest.
+4. **PvP: contested floors.** Two parties per floor instance, team flags, friendly-fire rules, the race
+   to the gate; ranks (E to S) from floors conquered.
 5. **Dedicated servers.** Host migration problem solved; bigger raids become possible.
-6. **Consoles.** Platform accounts through EOS, partner programs, certification. Separate spec.
+6. **More floors and the hub as a place.** Floor 2 and 3 as data assets, rankings board in the hub.
+7. **Consoles.** Platform accounts through EOS, partner programs, certification. Separate spec.
 
 Estimate: slice 1 is two to three focused sessions (replication of what exists); slices 2 and 3
 one week each; 4 and 5 depend on 1 to 3 holding up.
